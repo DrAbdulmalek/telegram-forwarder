@@ -19,7 +19,8 @@ from datetime import datetime
 from telethon import TelegramClient
 from telethon.errors import (
     FloodWaitError, ChannelPrivateError, UserBannedInChannelError,
-    MessageIdInvalidError, ChatWriteForbiddenError, SlowModeWaitError
+    MessageIdInvalidError, ChatWriteForbiddenError, SlowModeWaitError,
+    SessionPasswordNeededError
 )
 from telethon.tl.types import Message
 
@@ -53,21 +54,58 @@ class TelegramForwarder:
         self._cancelled = False
         self._progress_callback: Optional[Callable] = None
 
-    async def connect(self, phone: str = None, code_callback = None):
-        """Connect to Telegram."""
+    async def create_client(self):
+        """Create and connect TelegramClient without authorization."""
         self.client = TelegramClient(self.session_name, self.api_id, self.api_hash)
         await self.client.connect()
+        return self.client
 
-        if not await self.client.is_user_authorized():
-            if phone and code_callback:
-                await self.client.send_code_request(phone)
-                code = await code_callback()
-                await self.client.sign_in(phone, code)
+    async def is_authorized(self) -> bool:
+        """Check if the session is already authorized."""
+        if not self.client:
+            return False
+        return await self.client.is_user_authorized()
+
+    async def send_code(self, phone: str) -> dict:
+        """Send verification code to phone number. Returns phone_code_hash."""
+        if not self.client:
+            await self.create_client()
+        result = await self.client.send_code_request(phone)
+        self._phone = phone
+        self._phone_code_hash = result.phone_code_hash
+        logger.info(f"Code sent to {phone}, hash: {result.phone_code_hash}")
+        return {"phone_code_hash": result.phone_code_hash}
+
+    async def verify_code(self, code: str, password: str = None) -> bool:
+        """Verify the login code. Optionally provide 2FA password."""
+        if not self.client or not self._phone_code_hash:
+            raise RuntimeError("No pending code request. Call send_code first.")
+        try:
+            await self.client.sign_in(
+                phone=self._phone,
+                code=code,
+                phone_code_hash=self._phone_code_hash
+            )
+        except SessionPasswordNeededError:
+            if password:
+                await self.client.sign_in(password=password)
             else:
-                raise ValueError("Phone and code callback required for first login")
-
-        logger.info("Connected to Telegram successfully")
+                raise ValueError("2FA_PASSWORD_REQUIRED")
+        logger.info("Signed in successfully")
         return True
+
+    async def connect(self, phone: str = None, code_callback = None):
+        """Connect to Telegram (legacy method for backward compatibility)."""
+        await self.create_client()
+        if await self.client.is_user_authorized():
+            logger.info("Connected to Telegram successfully (existing session)")
+            return True
+        if phone and code_callback:
+            await self.send_code(phone)
+            code = await code_callback()
+            await self.verify_code(code)
+            return True
+        raise ValueError("Phone and code callback required for first login")
 
     async def disconnect(self):
         """Disconnect from Telegram."""
