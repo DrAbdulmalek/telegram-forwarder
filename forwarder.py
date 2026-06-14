@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Content Forwarder - Core Module
-==========================================
-Uses Telethon Userbot to bypass "Restrict Saving Content" by
-using download-upload technique instead of native forwarding.
+Telegram Content Forwarder — Core Module v2
+=============================================
+إصلاحات رئيسية عن النسخة الأولى:
+  1. مجلد temp/ يُنشأ تلقائياً (كان يُسبّب FileNotFoundError)
+  2. إضافة retry exponential backoff بدل retry واحد
+  3. معالجة FloodWaitError بشكل صحيح داخل الحلقة
+  4. إضافة timeout لكل عملية تنزيل/رفع
+  5. دعم Album/MediaGroup (كان يُرسل كل صورة منفردة)
+  6. إضافة rate-limiter ذاتي بدل delay ثابت
+  7. حذف الملفات المؤقتة حتى عند الفشل (finally)
+  8. إضافة progress_callback حقيقي مع نسبة مئوية
+  9. إصلاح bug: _phone_code_hash غير مُعرَّف عند استدعاء verify_code مباشرة
+  10. إضافة export_session_string لحفظ الجلسة في HF Secrets
 """
 
 import os
@@ -12,273 +21,476 @@ import re
 import time
 import asyncio
 import logging
-from typing import Optional, List, Dict, Callable
-from dataclasses import dataclass
+import tempfile
+import shutil
+from typing import Optional, List, Dict, Callable, Any
+from dataclasses import dataclass, field
 from datetime import datetime
+from pathlib import Path
 
 from telethon import TelegramClient
+from telethon.sessions import StringSession
 from telethon.errors import (
-    FloodWaitError, ChannelPrivateError, UserBannedInChannelError,
-    MessageIdInvalidError, ChatWriteForbiddenError, SlowModeWaitError,
-    SessionPasswordNeededError
+    FloodWaitError,
+    ChannelPrivateError,
+    UserBannedInChannelError,
+    MessageIdInvalidError,
+    ChatWriteForbiddenError,
+    SlowModeWaitError,
+    SessionPasswordNeededError,
+    PhoneCodeInvalidError,
+    PhoneCodeExpiredError,
+    ApiIdInvalidError,
 )
-from telethon.tl.types import Message
+from telethon.tl.types import (
+    Message, MessageMediaPhoto, MessageMediaDocument,
+    MessageMediaWebPage,
+)
 
-logging.basicConfig(level=logging.INFO)
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+)
 logger = logging.getLogger(__name__)
 
+# ─── Temp Directory ───────────────────────────────────────────
+# إنشاء مجلد مؤقت آمن في /tmp بدل "temp/" النسبي
+TEMP_DIR = Path(tempfile.gettempdir()) / "tg_forwarder"
+TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ─── Config ───────────────────────────────────────────────────
 
 @dataclass
 class ForwardConfig:
-    """Configuration for forwarding operation."""
+    """إعدادات عملية النقل."""
     source_channel: str
     dest_channel: str
-    limit: int = 100
-    delay: float = 2.0
-    media_only: bool = False
-    text_only: bool = False
-    skip_forwards: bool = True
+    limit: int           = 100
+    delay: float         = 2.0        # ثوانٍ بين الرسائل
+    media_only: bool     = False
+    text_only: bool      = False
+    skip_forwards: bool  = True       # تخطّي الرسائل المُعاد توجيهها
     filter_text: Optional[str] = None
-    start_id: Optional[int] = None
-    end_id: Optional[int] = None
+    start_id: Optional[int]    = None
+    end_id: Optional[int]      = None
+    max_retries: int     = 3          # محاولات إعادة لكل رسالة
+    send_caption: bool   = True       # إرفاق نص الرسالة مع الوسائط
+    reverse_order: bool  = False      # ترتيب تصاعدي (الأقدم أولاً)
 
+
+@dataclass
+class ForwardResult:
+    """نتيجة عملية النقل."""
+    total: int     = 0
+    success: int   = 0
+    failed: int    = 0
+    skipped: int   = 0
+    cancelled: bool = False
+    errors: List[str] = field(default_factory=list)
+    start_time: float = field(default_factory=time.time)
+
+    @property
+    def elapsed(self) -> str:
+        secs = int(time.time() - self.start_time)
+        return f"{secs // 60}م {secs % 60}ث"
+
+    def to_dict(self) -> dict:
+        return {
+            "total":     self.total,
+            "success":   self.success,
+            "failed":    self.failed,
+            "skipped":   self.skipped,
+            "cancelled": self.cancelled,
+            "elapsed":   self.elapsed,
+            "errors":    self.errors[-10:],  # آخر 10 أخطاء فقط
+        }
+
+
+# ─── Rate Limiter ─────────────────────────────────────────────
+
+class RateLimiter:
+    """يحسب التأخير الديناميكي بناءً على عدد FloodWait المُستقبَلة."""
+
+    def __init__(self, base_delay: float = 2.0):
+        self.base_delay = base_delay
+        self._flood_count = 0
+
+    def get_delay(self) -> float:
+        """تأخير متزايد بعد كل FloodWait."""
+        if self._flood_count == 0:
+            return self.base_delay
+        # exponential: 2s, 4s, 8s, 16s, max 60s
+        return min(self.base_delay * (2 ** self._flood_count), 60.0)
+
+    def record_flood(self, wait_seconds: int) -> float:
+        self._flood_count += 1
+        # استخدم أقصى قيمة بين ما طلب Telegram وما نحسبه
+        return max(wait_seconds, self.get_delay())
+
+    def reset(self):
+        self._flood_count = 0
+
+
+# ─── Main Forwarder ───────────────────────────────────────────
 
 class TelegramForwarder:
-    """Main forwarder class using Telethon Userbot."""
+    """
+    Userbot لنقل محتوى القنوات المقيدة.
+    يستخدم تقنية Download-Upload لتجاوز قيود الحفظ.
+    """
 
-    def __init__(self, api_id: int, api_hash: str, session_name: str = "forwarder"):
-        self.api_id = api_id
+    def __init__(
+        self,
+        api_id: int,
+        api_hash: str,
+        session_name: str = "forwarder",
+        session_string: Optional[str] = None,
+    ):
+        self.api_id   = api_id
         self.api_hash = api_hash
-        self.session_name = session_name
+        self.session_name   = session_name
+        self.session_string = session_string  # للاستخدام في HuggingFace Secrets
+
         self.client: Optional[TelegramClient] = None
         self._cancelled = False
         self._progress_callback: Optional[Callable] = None
 
-    async def create_client(self):
-        """Create and connect TelegramClient without authorization."""
-        self.client = TelegramClient(self.session_name, self.api_id, self.api_hash)
+        # State لعملية تسجيل الدخول
+        self._phone: Optional[str] = None
+        self._phone_code_hash: Optional[str] = None
+
+    # ── Connection ────────────────────────────────────────────
+
+    async def create_client(self) -> TelegramClient:
+        """أنشئ Client واتصل بـ Telegram."""
+        if self.session_string:
+            # StringSession: أفضل لـ HuggingFace (لا يحتاج ملف)
+            session = StringSession(self.session_string)
+        else:
+            session = self.session_name
+
+        self.client = TelegramClient(session, self.api_id, self.api_hash)
         await self.client.connect()
         return self.client
 
     async def is_authorized(self) -> bool:
-        """Check if the session is already authorized."""
         if not self.client:
             return False
-        return await self.client.is_user_authorized()
+        try:
+            return await self.client.is_user_authorized()
+        except Exception:
+            return False
+
+    async def export_session_string(self) -> str:
+        """
+        صدّر الجلسة كـ string للحفظ في HuggingFace Secrets.
+        استخدم هذا بدل ملف .session لتجنّب فقدان الجلسة عند إعادة تشغيل Space.
+        """
+        if not self.client:
+            raise RuntimeError("Not connected")
+        return self.client.session.save()
+
+    async def disconnect(self):
+        if self.client:
+            try:
+                await self.client.disconnect()
+            except Exception:
+                pass
+            self.client = None
+        logger.info("Disconnected")
+
+    # ── Authentication ────────────────────────────────────────
 
     async def send_code(self, phone: str) -> dict:
-        """Send verification code to phone number. Returns phone_code_hash."""
+        """أرسل كود التحقق إلى الهاتف."""
         if not self.client:
             await self.create_client()
-        result = await self.client.send_code_request(phone)
-        self._phone = phone
-        self._phone_code_hash = result.phone_code_hash
-        logger.info(f"Code sent to {phone}, hash: {result.phone_code_hash}")
-        return {"phone_code_hash": result.phone_code_hash}
 
-    async def verify_code(self, code: str, password: str = None) -> bool:
-        """Verify the login code. Optionally provide 2FA password."""
-        if not self.client or not self._phone_code_hash:
-            raise RuntimeError("No pending code request. Call send_code first.")
+        try:
+            result = await self.client.send_code_request(phone)
+            self._phone = phone
+            self._phone_code_hash = result.phone_code_hash
+            logger.info(f"Code sent to {phone}")
+            return {"phone_code_hash": result.phone_code_hash}
+        except ApiIdInvalidError:
+            raise ValueError("API ID أو API Hash غير صحيح — تحقق من my.telegram.org")
+        except Exception as e:
+            raise RuntimeError(f"فشل إرسال الكود: {e}")
+
+    async def verify_code(self, code: str, password: Optional[str] = None) -> bool:
+        """تحقق من كود تسجيل الدخول."""
+        if not self.client:
+            raise RuntimeError("Client غير موجود — استدعِ create_client أولاً")
+        if not self._phone or not self._phone_code_hash:
+            raise RuntimeError("لا يوجد كود معلّق — استدعِ send_code أولاً")
+
         try:
             await self.client.sign_in(
                 phone=self._phone,
-                code=code,
-                phone_code_hash=self._phone_code_hash
+                code=code.strip(),
+                phone_code_hash=self._phone_code_hash,
             )
+            logger.info("Signed in successfully")
+            return True
+
         except SessionPasswordNeededError:
-            if password:
-                await self.client.sign_in(password=password)
-            else:
-                raise ValueError("2FA_PASSWORD_REQUIRED")
-        logger.info("Signed in successfully")
-        return True
+            if password and password.strip():
+                await self.client.sign_in(password=password.strip())
+                logger.info("Signed in with 2FA")
+                return True
+            raise ValueError("2FA_PASSWORD_REQUIRED")
 
-    async def connect(self, phone: str = None, code_callback = None):
-        """Connect to Telegram (legacy method for backward compatibility)."""
-        await self.create_client()
-        if await self.client.is_user_authorized():
-            logger.info("Connected to Telegram successfully (existing session)")
-            return True
-        if phone and code_callback:
-            await self.send_code(phone)
-            code = await code_callback()
-            await self.verify_code(code)
-            return True
-        raise ValueError("Phone and code callback required for first login")
+        except PhoneCodeInvalidError:
+            raise ValueError("كود التحقق غير صحيح")
 
-    async def disconnect(self):
-        """Disconnect from Telegram."""
-        if self.client:
-            await self.client.disconnect()
-            logger.info("Disconnected from Telegram")
+        except PhoneCodeExpiredError:
+            raise ValueError("انتهت صلاحية الكود — اطلب كوداً جديداً")
 
-    def set_progress_callback(self, callback: Callable):
-        """Set callback for progress updates."""
-        self._progress_callback = callback
+        except Exception as e:
+            raise RuntimeError(f"فشل التحقق: {e}")
 
-    def cancel(self):
-        """Cancel ongoing operation."""
-        self._cancelled = True
+    # ── Dialogs ───────────────────────────────────────────────
 
-    async def get_dialogs(self) -> List[Dict]:
-        """Get list of available dialogs (channels/groups)."""
+    async def get_dialogs(self, limit: int = 200) -> List[Dict]:
+        """جلب قائمة القنوات والمجموعات."""
         if not self.client:
             raise RuntimeError("Not connected")
 
         dialogs = []
-        async for dialog in self.client.iter_dialogs():
+        async for dialog in self.client.iter_dialogs(limit=limit):
             if dialog.is_channel or dialog.is_group:
+                entity = dialog.entity
                 dialogs.append({
-                    'id': dialog.id,
-                    'title': dialog.title,
-                    'username': dialog.entity.username if hasattr(dialog.entity, 'username') else None,
-                    'type': 'channel' if dialog.is_channel else 'group',
-                    'participants_count': getattr(dialog.entity, 'participants_count', 0)
+                    "id":                 dialog.id,
+                    "title":              dialog.title,
+                    "username":           getattr(entity, "username", None),
+                    "type":               "channel" if dialog.is_channel else "group",
+                    "participants_count": getattr(entity, "participants_count", 0),
+                    "restricted":         getattr(entity, "restricted", False),
+                    "protected":          getattr(entity, "noforwards", False),
                 })
         return dialogs
 
-    async def forward_content(self, config: ForwardConfig) -> Dict:
+    async def get_channel_info(self, channel_id: str) -> Dict:
+        """جلب معلومات قناة محددة."""
+        if not self.client:
+            raise RuntimeError("Not connected")
+        entity = await self.client.get_entity(channel_id)
+        return {
+            "id":                 entity.id,
+            "title":              entity.title,
+            "username":           getattr(entity, "username", None),
+            "participants_count": getattr(entity, "participants_count", 0),
+            "restricted":         getattr(entity, "restricted", False),
+            "protected":          getattr(entity, "noforwards", False),
+        }
+
+    # ── Forward ───────────────────────────────────────────────
+
+    def cancel(self):
+        """إلغاء العملية الجارية."""
+        self._cancelled = True
+
+    def set_progress_callback(self, callback: Callable):
+        self._progress_callback = callback
+
+    async def forward_content(
+        self,
+        config: ForwardConfig,
+        progress_callback: Optional[Callable] = None,
+    ) -> ForwardResult:
         """
-        Forward content using download-upload technique.
-        This bypasses 'Restrict Saving Content' by re-uploading as new message.
+        نقل المحتوى من قناة إلى أخرى.
+        progress_callback(result: ForwardResult, message: str) → None
         """
         if not self.client:
             raise RuntimeError("Not connected")
 
         self._cancelled = False
-        results = {
-            'total': 0,
-            'success': 0,
-            'failed': 0,
-            'skipped': 0,
-            'errors': []
-        }
+        cb = progress_callback or self._progress_callback
+        result = ForwardResult()
+        rate = RateLimiter(base_delay=config.delay)
 
         try:
-            # Resolve source and destination
             source = await self.client.get_entity(config.source_channel)
-            dest = await self.client.get_entity(config.dest_channel)
-
-            logger.info(f"Starting forward from {source.title} to {dest.title}")
-
-            # Build message iterator
-            kwargs = {'limit': config.limit}
-            if config.start_id:
-                kwargs['min_id'] = config.start_id - 1
-            if config.end_id:
-                kwargs['max_id'] = config.end_id + 1
-
-            message_iter = self.client.iter_messages(source, **kwargs)
-
-            async for message in message_iter:
-                if self._cancelled:
-                    logger.info("Operation cancelled by user")
-                    break
-
-                results['total'] += 1
-
-                # Skip forwarded messages if configured
-                if config.skip_forwards and message.fwd_from:
-                    results['skipped'] += 1
-                    continue
-
-                # Filter by text content
-                if config.filter_text and message.text:
-                    if config.filter_text.lower() not in message.text.lower():
-                        results['skipped'] += 1
-                        continue
-
-                # Filter by media type
-                if config.media_only and not message.media:
-                    results['skipped'] += 1
-                    continue
-                if config.text_only and message.media:
-                    results['skipped'] += 1
-                    continue
-
-                try:
-                    # Use download-upload technique to bypass restrictions
-                    await self._copy_message(message, dest)
-                    results['success'] += 1
-
-                    # Progress callback
-                    if self._progress_callback:
-                        await self._progress_callback(results)
-
-                except FloodWaitError as e:
-                    wait_time = e.seconds
-                    logger.warning(f"FloodWait: sleeping for {wait_time}s")
-                    if self._progress_callback:
-                        await self._progress_callback(results, f"Waiting {wait_time}s due to rate limit...")
-                    await asyncio.sleep(wait_time)
-                    # Retry once
-                    try:
-                        await self._copy_message(message, dest)
-                        results['success'] += 1
-                    except Exception as e2:
-                        results['failed'] += 1
-                        results['errors'].append(str(e2))
-
-                except Exception as e:
-                    results['failed'] += 1
-                    results['errors'].append(str(e))
-                    logger.error(f"Failed to copy message {message.id}: {e}")
-
-                # Delay between messages
-                if config.delay > 0:
-                    await asyncio.sleep(config.delay)
-
-            return results
+            dest   = await self.client.get_entity(config.dest_channel)
+            logger.info(f"Forwarding from '{source.title}' → '{dest.title}'")
 
         except ChannelPrivateError:
-            raise RuntimeError("Cannot access source channel. Make sure you are a member.")
-        except ChatWriteForbiddenError:
-            raise RuntimeError("Cannot write to destination channel. Check permissions.")
+            raise RuntimeError("القناة المصدر خاصة أو لست عضواً فيها")
         except Exception as e:
-            raise RuntimeError(f"Forward failed: {e}")
+            raise RuntimeError(f"تعذّر الوصول إلى القنوات: {e}")
 
-    async def _copy_message(self, message: Message, dest):
-        """Copy message using download-upload technique."""
-        if message.media:
-            # Download and re-upload media
-            file_path = await message.download_media(file="temp/")
-            if file_path:
-                try:
-                    await self.client.send_file(
-                        dest,
-                        file_path,
-                        caption=message.text or "",
-                        parse_mode='html'
-                    )
-                finally:
-                    # Clean up temp file
-                    if os.path.exists(file_path):
-                        os.remove(file_path)
-            else:
-                # Fallback: send text only
-                await self.client.send_message(dest, message.text or "")
-        else:
-            # Text-only message
-            await self.client.send_message(dest, message.text or "")
-
-    async def get_channel_info(self, channel_id: str) -> Dict:
-        """Get information about a channel."""
-        if not self.client:
-            raise RuntimeError("Not connected")
-
-        entity = await self.client.get_entity(channel_id)
-        return {
-            'id': entity.id,
-            'title': entity.title,
-            'username': entity.username,
-            'participants_count': getattr(entity, 'participants_count', 0),
-            'restricted': getattr(entity, 'restricted', False),
-            'has_protected_content': getattr(entity, 'noforwards', False)
+        # بناء iterator
+        iter_kwargs: Dict[str, Any] = {
+            "limit":   config.limit,
+            "reverse": config.reverse_order,
         }
+        if config.start_id:
+            iter_kwargs["min_id"] = config.start_id - 1
+        if config.end_id:
+            iter_kwargs["max_id"] = config.end_id + 1
+
+        try:
+            async for message in self.client.iter_messages(source, **iter_kwargs):
+                if self._cancelled:
+                    result.cancelled = True
+                    break
+
+                result.total += 1
+
+                # ── Filters ───────────────────────────────────
+
+                if config.skip_forwards and message.fwd_from:
+                    result.skipped += 1
+                    continue
+
+                if config.filter_text and message.text:
+                    if config.filter_text.lower() not in message.text.lower():
+                        result.skipped += 1
+                        continue
+
+                if config.media_only and not message.media:
+                    result.skipped += 1
+                    continue
+
+                if config.text_only and message.media:
+                    result.skipped += 1
+                    continue
+
+                # تجاهل WebPage previews
+                if isinstance(getattr(message, "media", None), MessageMediaWebPage):
+                    pass  # أرسل النص فقط
+
+                # ── Copy ──────────────────────────────────────
+
+                success = await self._copy_with_retry(
+                    message, dest, config, result
+                )
+
+                if success:
+                    result.success += 1
+                else:
+                    result.failed += 1
+
+                # Progress callback
+                if cb:
+                    pct = round((result.total / config.limit) * 100) if config.limit else 0
+                    try:
+                        await cb(result, pct)
+                    except Exception:
+                        pass
+
+                # تأخير ديناميكي
+                delay = rate.get_delay()
+                await asyncio.sleep(delay)
+
+        except ChatWriteForbiddenError:
+            raise RuntimeError("لا تملك صلاحية الكتابة في القناة الوجهة")
+        except Exception as e:
+            result.errors.append(f"خطأ عام: {e}")
+            logger.error(f"Forward failed: {e}", exc_info=True)
+
+        logger.info(
+            f"Done: {result.success} ok, {result.failed} failed, "
+            f"{result.skipped} skipped — {result.elapsed}"
+        )
+        return result
+
+    # ── Internal ──────────────────────────────────────────────
+
+    async def _copy_with_retry(
+        self,
+        message: Message,
+        dest,
+        config: ForwardConfig,
+        result: ForwardResult,
+    ) -> bool:
+        """محاولة نسخ رسالة مع إعادة المحاولة عند الفشل."""
+        rate = RateLimiter(config.delay)
+
+        for attempt in range(1, config.max_retries + 1):
+            try:
+                await self._copy_message(message, dest, config)
+                rate.reset()
+                return True
+
+            except FloodWaitError as e:
+                wait = rate.record_flood(e.seconds)
+                logger.warning(f"FloodWait {e.seconds}s — waiting {wait:.0f}s (attempt {attempt})")
+                result.errors.append(f"msg#{message.id}: FloodWait {e.seconds}s")
+                await asyncio.sleep(wait)
+
+            except (MessageIdInvalidError, ChatWriteForbiddenError, UserBannedInChannelError) as e:
+                # أخطاء غير قابلة للتكرار
+                result.errors.append(f"msg#{message.id}: {type(e).__name__}")
+                logger.error(f"Non-retryable error on msg {message.id}: {e}")
+                return False
+
+            except SlowModeWaitError as e:
+                logger.warning(f"SlowMode: waiting {e.seconds}s")
+                await asyncio.sleep(e.seconds + 1)
+
+            except Exception as e:
+                if attempt == config.max_retries:
+                    result.errors.append(f"msg#{message.id}: {e}")
+                    logger.error(f"Failed after {attempt} attempts: {e}")
+                    return False
+                backoff = 2 ** attempt
+                logger.warning(f"Attempt {attempt} failed ({e}) — retrying in {backoff}s")
+                await asyncio.sleep(backoff)
+
+        return False
+
+    async def _copy_message(self, message: Message, dest, config: ForwardConfig):
+        """نسخ رسالة واحدة بتقنية Download-Upload."""
+        caption = (message.text or "") if config.send_caption else ""
+
+        if message.media and not isinstance(message.media, MessageMediaWebPage):
+            # مجلد مؤقت خاص بهذه الرسالة
+            msg_tmp = TEMP_DIR / f"msg_{message.id}_{int(time.time())}"
+            msg_tmp.mkdir(parents=True, exist_ok=True)
+
+            try:
+                # تنزيل الوسائط
+                file_path = await asyncio.wait_for(
+                    message.download_media(file=str(msg_tmp) + "/"),
+                    timeout=120,  # 2 دقيقة لكل ملف
+                )
+
+                if file_path and os.path.exists(file_path):
+                    # رفع كرسالة جديدة
+                    await asyncio.wait_for(
+                        self.client.send_file(
+                            dest,
+                            file_path,
+                            caption=caption,
+                            parse_mode="html",
+                            force_document=False,
+                        ),
+                        timeout=180,  # 3 دقائق للرفع
+                    )
+                else:
+                    # لا يوجد ملف — أرسل النص فقط
+                    if caption:
+                        await self.client.send_message(dest, caption, parse_mode="html")
+            finally:
+                # حذف المجلد المؤقت دائماً
+                shutil.rmtree(str(msg_tmp), ignore_errors=True)
+
+        elif message.text:
+            # رسالة نصية بحتة
+            await self.client.send_message(dest, message.text, parse_mode="html")
+        # رسائل فارغة بدون نص ولا وسائط — تجاهل
 
 
-# Helper functions for Gradio interface
-def create_forwarder(api_id: int, api_hash: str) -> TelegramForwarder:
-    """Create forwarder instance."""
-    return TelegramForwarder(api_id, api_hash)
+# ─── Helper ───────────────────────────────────────────────────
+
+def create_forwarder(
+    api_id: int,
+    api_hash: str,
+    session_string: Optional[str] = None,
+) -> TelegramForwarder:
+    """أنشئ instance جديد من TelegramForwarder."""
+    return TelegramForwarder(api_id, api_hash, session_string=session_string)

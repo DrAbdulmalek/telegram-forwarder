@@ -1,27 +1,22 @@
-# Telegram Content Forwarder - Docker Space for Hugging Face
-FROM python:3.10-slim
+FROM python:3.11-slim
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y \
-    gcc \
-    libffi-dev \
-    && rm -rf /var/lib/apt/lists/*
+# System deps — gcc مطلوب لـ cryptography/telethon
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    gcc libffi-dev libssl-dev curl && \
+    rm -rf /var/lib/apt/lists/*
 
-# Create app directory
 WORKDIR /app
 
-# Copy requirements first for caching
+# Python deps
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy application files
+# App
 COPY . .
 
-# Create temp directory for downloads
-RUN mkdir -p temp
+# Temp directory with write permissions
+RUN mkdir -p /tmp/tg_forwarder && chmod 777 /tmp/tg_forwarder
 
-# Expose port
 EXPOSE 7860
 
-# Run the app
 CMD ["python", "app.py"]
