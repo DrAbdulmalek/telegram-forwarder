@@ -179,7 +179,7 @@ def create_app():
 
                     login_code = gr.Textbox(label="كود التحقق", placeholder="أدخل الكود المكون من 5 أرقام")
                     two_fa_pass = gr.Textbox(label="كلمة مرور التحقق الثنائي (اختياري)", type="password",
-                                              visible=False, placeholder="إذا كنت مفعل التحقق الثنائي")
+                                              visible=True, placeholder="إذا كنت مفعل التحقق الثنائي أدخلها هنا")
 
                     verify_btn = gr.Button("تأكيد وتسجيل الدخول", variant="primary")
 
