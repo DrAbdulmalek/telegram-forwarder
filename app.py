@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Content Forwarder — Gradio UI v2
+Telegram Content Forwarder — Gradio UI v2.1
 ==========================================
 تحسينات عن النسخة الأولى:
   1. شريط تقدم حقيقي يتحدث لحظياً (Generator-based)
@@ -12,16 +12,27 @@ Telegram Content Forwarder — Gradio UI v2
   6. معالجة أفضل لأخطاء API ID/Hash
   7. إضافة tab "الإحصائيات" لعرض نتائج آخر عملية
   8. تحذير عند اختيار تأخير < 1 ثانية
+
+تحسينات v2.1:
+  9. تبويب "الإحصائيات" مع عرض مفصّل (ألبومات / منفردة / أخطاء)
+  10. زر "تنظيف المجلد المؤقت" للصيانة
+  11. عرض معلومات القناة المصدر والوجهة قبل النقل
+  12. تحسينات بصرية ورسائل أوضح
 """
 
 import os
 import sys
 import asyncio
+import shutil
 import gradio as gr
 from typing import Optional, Generator
+from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-from forwarder import TelegramForwarder, ForwardConfig, ForwardResult, create_forwarder
+from forwarder import (
+    TelegramForwarder, ForwardConfig, ForwardResult,
+    create_forwarder, TEMP_DIR,
+)
 
 # ─── Global State ─────────────────────────────────────────────
 
@@ -63,6 +74,27 @@ CSS = """
     background: #cfe2ff; color: #052c65;
     border: 1px solid #9ec5fe; border-radius: 10px;
     padding: 12px 16px; margin: 8px 0;
+}
+
+.stat-card {
+    display: inline-block;
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 10px;
+    padding: 16px 24px;
+    margin: 6px;
+    text-align: center;
+    min-width: 120px;
+}
+.stat-card .stat-number {
+    font-size: 2em;
+    font-weight: 700;
+    color: #1a73e8;
+}
+.stat-card .stat-label {
+    font-size: .85em;
+    color: #6c757d;
+    margin-top: 4px;
 }
 """
 
@@ -240,13 +272,49 @@ def do_channel_info(channel_id):
     try:
         info = _run(forwarder.get_channel_info(channel_id))
         protected = "🔒 نعم" if info.get("protected") else "✅ لا"
+        restricted = "⛔ نعم" if info.get("restricted") else "✅ لا"
+        members = info.get("participants_count", 0) or "غير معروف"
+        username = info.get("username") or "بدون @username"
         return (
-            f"**{info['title']}** | "
-            f"الأعضاء: {info['participants_count']:,} | "
-            f"المحتوى محمي: {protected}"
+            f"**{info['title']}**\n\n"
+            f"| الخاصية | القيمة |\n"
+            f"|---|---|\n"
+            f"| الأعضاء | {members} |\n"
+            f"| @username | @{username} |\n"
+            f"| محتوى محمي | {protected} |\n"
+            f"| مقيد | {restricted} |"
         )
     except Exception:
         return ""
+
+
+def do_pre_forward_info(source_val, dest_val, source_manual_val, dest_manual_val):
+    """عرض ملخص القنوات قبل بدء النقل."""
+    global forwarder
+    if not forwarder or not _run(forwarder.is_authorized()):
+        return _status_html("❌ غير متصل", "error")
+
+    source = (source_manual_val or "").strip() or source_val
+    dest   = (dest_manual_val or "").strip() or dest_val
+
+    if not source or not dest:
+        return _status_html("❌ اختر القناة المصدر والوجهة أولاً", "error")
+
+    try:
+        src_info = _run(forwarder.get_channel_info(source))
+        dst_info = _run(forwarder.get_channel_info(dest))
+
+        src_protected = "🔒 محمي" if src_info.get("protected") else "✅ عادي"
+        dst_protected = "🔒 محمي" if dst_info.get("protected") else "✅ عادي"
+
+        return _status_html(
+            f"📥 **المصدر**: {src_info['title']} ({src_info.get('participants_count', '?')} عضو, {src_protected})<br>"
+            f"📤 **الوجهة**: {dst_info['title']} ({dst_info.get('participants_count', '?')} عضو, {dst_protected})<br>"
+            f"{'⚠️ سيتم استخدام تقنية Download-Upload لتجاوز حماية المحتوى' if src_info.get('protected') else '✅ المحتوى غير محمي — النقل عادي'}",
+            "info"
+        )
+    except Exception as e:
+        return _status_html(f"❌ تعذّر جلب المعلومات: {e}", "error")
 
 
 def do_forward(
@@ -295,7 +363,7 @@ def do_forward(
 
     yield _status_html("⏳ جارٍ الاتصال بالقنوات…", "info"), 0, "{}"
 
-    # Progress tracking عبر asyncio Queue
+    # Progress tracking عبر asyncio.Queue
     progress_queue = asyncio.Queue()
 
     async def progress_cb(result: ForwardResult, pct: int):
@@ -345,6 +413,7 @@ def do_forward(
             status = _status_html(
                 f"⏳ جارٍ النقل — "
                 f"نجح: {r.success} | فشل: {r.failed} | تخطى: {r.skipped} | "
+                f"الألبومات: {r.albums} | "
                 f"الإجمالي: {r.total}/{config.limit}",
                 "info"
             )
@@ -360,6 +429,50 @@ def do_cancel():
     return _status_html("⛔ تم إرسال أمر الإلغاء…", "warn")
 
 
+def do_clear_temp():
+    """تنظيف المجلد المؤقت."""
+    try:
+        if TEMP_DIR.exists():
+            count = sum(1 for _ in TEMP_DIR.rglob("*") if _.is_file())
+            shutil.rmtree(str(TEMP_DIR), ignore_errors=True)
+            TEMP_DIR.mkdir(parents=True, exist_ok=True)
+            if count > 0:
+                return _status_html(f"🧹 تم حذف {count} ملف مؤقت", "success")
+            return _status_html("🧹 المجلد المؤقت نظيف بالفعل", "info")
+        return _status_html("🧹 المجلد المؤقت غير موجود", "info")
+    except Exception as e:
+        return _status_html(f"❌ فشل التنظيف: {e}", "error")
+
+
+def do_show_stats():
+    """عرض إحصائيات آخر عملية نقل."""
+    global last_result
+    if not last_result:
+        return (
+            _status_html("لا توجد عمليات سابقة", "info"),
+            "{}",
+        )
+
+    r = last_result
+    status_text = f"**نتيجة آخر عملية نقل**\n\n"
+    status_text += f"| المقياس | القيمة |\n"
+    status_text += f"|---|---|\n"
+    status_text += f"| الإجمالي | {r.total} |\n"
+    status_text += f"| نجح | ✅ {r.success} |\n"
+    status_text += f"| فشل | ❌ {r.failed} |\n"
+    status_text += f"| تخطّى | ⏭️ {r.skipped} |\n"
+    status_text += f"| ألبومات | 🖼️ {r.albums} |\n"
+    status_text += f"| رسائل منفردة | 📄 {r.singles} |\n"
+    status_text += f"| الوقت | ⏱️ {r.elapsed} |\n"
+
+    if r.cancelled:
+        status_text += f"| الحالة | ⛔ مُلغاة |\n"
+    else:
+        status_text += f"| الحالة | ✅ مكتملة |\n"
+
+    return status_text, str(r.to_dict())
+
+
 # ─── UI ───────────────────────────────────────────────────────
 
 def build_app():
@@ -368,7 +481,7 @@ def build_app():
         gr.HTML("""
         <div class="header">
             <h1>📨 Telegram Content Forwarder</h1>
-            <p>نقل محتوى القنوات المقيدة باستخدام Userbot — v2.0</p>
+            <p>نقل محتوى القنوات المقيدة باستخدام Userbot — v2.1</p>
         </div>
         """)
 
@@ -449,6 +562,10 @@ def build_app():
                         dest_manual = gr.Textbox(label="أو أدخل يدوياً", placeholder="@my_channel")
                         dest_info   = gr.Markdown()
 
+                # ملخص قبل النقل
+                pre_forward_info = gr.HTML()
+                check_info_btn = gr.Button("🔍 عرض معلومات القنوات", variant="secondary")
+
                 gr.HTML("""<div class="warn-box">
                     ⚠️ القنوات المُشار إليها بـ 🔒 لديها محتوى محمي —
                     ستعمل تقنية Download-Upload على تجاوز هذا القيد.
@@ -499,7 +616,22 @@ def build_app():
                 stats_out      = gr.Code(label="آخر نتيجة (JSON)", language="json", value="{}")
 
             # ══════════════════════════════════════════════
-            # TAB 5: المساعدة
+            # TAB 5: الإحصائيات
+            # ══════════════════════════════════════════════
+            with gr.Tab("📊 الإحصائيات"):
+
+                gr.Markdown("### نتائج آخر عملية نقل")
+
+                with gr.Row():
+                    show_stats_btn = gr.Button("📊 عرض الإحصائيات", variant="secondary")
+                    clear_temp_btn = gr.Button("🧹 تنظيف المجلد المؤقت", variant="secondary")
+
+                stats_display = gr.Markdown("لا توجد عمليات سابقة")
+                stats_json    = gr.Code(label="بيانات JSON كاملة", language="json", value="{}")
+                maintenance_status = gr.HTML()
+
+            # ══════════════════════════════════════════════
+            # TAB 6: المساعدة
             # ══════════════════════════════════════════════
             with gr.Tab("❓ المساعدة"):
                 gr.Markdown("""
@@ -520,6 +652,7 @@ def build_app():
 ### الخطوة 3 — اختيار القنوات
 - اضغط **تحديث قائمة القنوات**
 - اختر المصدر (القناة المقيدة) والوجهة (قناتك الخاصة)
+- اضغط **عرض معلومات القنوات** للتأكد
 
 ### الخطوة 4 — ضبط الإعدادات والنقل
 - حدد عدد الرسائل والتأخير (2 ثانية موصى بها)
@@ -534,11 +667,16 @@ def build_app():
 2. يُعيد رفعها كرسائل جديدة
 3. يحذف الملفات المؤقتة فوراً
 
+### دعم الألبومات (جديد v2.1)
+التطبيق يكتشف تلقائياً الرسائل المجمّعة (Albums/MediaGroups) وينقلها كألبوم واحد
+بدل إرسال كل صورة/فيديو منفصلاً.
+
 ### نصائح للاستخدام الآمن
 - استخدم تأخيراً لا يقل عن **2 ثانية**
 - لا تنقل أكثر من **500 رسالة** في الجلسة الواحدة
 - استرح بين العمليات المتكررة
 - **لا تُشارك Session String** مع أي أحد
+- نظّف المجلد المؤقت بانتظام من تبويب الإحصائيات
                 """)
 
         # ── Wire Events ───────────────────────────────────────
@@ -571,6 +709,13 @@ def build_app():
         source_list.change(do_channel_info, inputs=[source_list], outputs=[source_info])
         dest_list.change(do_channel_info,   inputs=[dest_list],   outputs=[dest_info])
 
+        # Pre-forward info
+        check_info_btn.click(
+            do_pre_forward_info,
+            inputs=[source_list, dest_list, source_manual, dest_manual],
+            outputs=[pre_forward_info],
+        )
+
         # Forward
         start_btn.click(
             do_forward,
@@ -583,6 +728,16 @@ def build_app():
             outputs=[forward_status, progress_bar, stats_out],
         )
         cancel_btn.click(do_cancel, outputs=[forward_status])
+
+        # Statistics
+        show_stats_btn.click(
+            do_show_stats,
+            outputs=[stats_display, stats_json],
+        )
+        clear_temp_btn.click(
+            do_clear_temp,
+            outputs=[maintenance_status],
+        )
 
     return app
 

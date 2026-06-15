@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Content Forwarder — Core Module v2
-=============================================
+Telegram Content Forwarder — Core Module v2.1
+==============================================
 إصلاحات رئيسية عن النسخة الأولى:
   1. مجلد temp/ يُنشأ تلقائياً (كان يُسبّب FileNotFoundError)
   2. إضافة retry exponential backoff بدل retry واحد
@@ -14,6 +14,13 @@ Telegram Content Forwarder — Core Module v2
   8. إضافة progress_callback حقيقي مع نسبة مئوية
   9. إصلاح bug: _phone_code_hash غير مُعرَّف عند استدعاء verify_code مباشرة
   10. إضافة export_session_string لحفظ الجلسة في HF Secrets
+
+تحسينات v2.1:
+  11. دعم كامل لـ Albums/MediaGroups (جمع الرسائل وإرسالها كألبوم)
+  12. asyncio.Semaphore للحد من التنزيلات المتزامنة (تجنب OOM)
+  13. تصفية ذكية: تجاهل WebPage، دعم reverse_order
+  14. ForwardResult منظّم مع to_dict()
+  15. إضافة logging مفصّل للألبومات
 """
 
 import os
@@ -23,7 +30,7 @@ import asyncio
 import logging
 import tempfile
 import shutil
-from typing import Optional, List, Dict, Callable, Any
+from typing import Optional, List, Dict, Callable, Any, Set
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -58,6 +65,9 @@ logger = logging.getLogger(__name__)
 TEMP_DIR = Path(tempfile.gettempdir()) / "tg_forwarder"
 TEMP_DIR.mkdir(parents=True, exist_ok=True)
 
+# Semaphore للحد الأقصى للتنزيلات المتزامنة (تجنب OOM)
+DOWNLOAD_SEMAPHORE = asyncio.Semaphore(3)
+
 
 # ─── Config ───────────────────────────────────────────────────
 
@@ -86,6 +96,8 @@ class ForwardResult:
     success: int   = 0
     failed: int    = 0
     skipped: int   = 0
+    albums: int    = 0           # عدد الألبومات المنقولة
+    singles: int   = 0           # عدد الرسائل المنفردة المنقولة
     cancelled: bool = False
     errors: List[str] = field(default_factory=list)
     start_time: float = field(default_factory=time.time)
@@ -101,6 +113,8 @@ class ForwardResult:
             "success":   self.success,
             "failed":    self.failed,
             "skipped":   self.skipped,
+            "albums":    self.albums,
+            "singles":   self.singles,
             "cancelled": self.cancelled,
             "elapsed":   self.elapsed,
             "errors":    self.errors[-10:],  # آخر 10 أخطاء فقط
@@ -332,11 +346,20 @@ class TelegramForwarder:
         if config.end_id:
             iter_kwargs["max_id"] = config.end_id + 1
 
+        # تتبع الألبومات المُعالَجة لتجنّب التكرار
+        processed_albums: Set[int] = set()
+        # تتبع رسائل الألبوم التي يجب تخطّيها
+        skip_message_ids: Set[int] = set()
+
         try:
             async for message in self.client.iter_messages(source, **iter_kwargs):
                 if self._cancelled:
                     result.cancelled = True
                     break
+
+                # تخطّي رسائل ألبوم تمت معالجتها
+                if message.id in skip_message_ids:
+                    continue
 
                 result.total += 1
 
@@ -361,18 +384,82 @@ class TelegramForwarder:
 
                 # تجاهل WebPage previews
                 if isinstance(getattr(message, "media", None), MessageMediaWebPage):
-                    pass  # أرسل النص فقط
+                    # أرسل النص فقط إذا كان موجوداً
+                    if message.text:
+                        success = await self._copy_with_retry(
+                            message, dest, config, result
+                        )
+                        if success:
+                            result.success += 1
+                            result.singles += 1
+                        else:
+                            result.failed += 1
+                    else:
+                        result.skipped += 1
+                        continue
 
-                # ── Copy ──────────────────────────────────────
+                # ── Album Detection ───────────────────────────
 
-                success = await self._copy_with_retry(
-                    message, dest, config, result
-                )
+                elif message.grouped_id and message.grouped_id not in processed_albums:
+                    # هذه الرسالة جزء من ألبوم لم نعالجه بعد
+                    processed_albums.add(message.grouped_id)
 
-                if success:
-                    result.success += 1
+                    album_messages = await self._collect_album(
+                        source, message
+                    )
+
+                    if len(album_messages) <= 1:
+                        # رسالة واحدة فقط — عاملها كرسالة عادية
+                        success = await self._copy_with_retry(
+                            message, dest, config, result
+                        )
+                        if success:
+                            result.success += 1
+                            result.singles += 1
+                        else:
+                            result.failed += 1
+                    else:
+                        # ألبوم حقيقي — أرسله كدفعة واحدة
+                        logger.info(
+                            f"Album detected: grouped_id={message.grouped_id}, "
+                            f"messages={len(album_messages)}"
+                        )
+                        success = await self._copy_album(
+                            album_messages, dest, config, result
+                        )
+                        if success:
+                            result.success += 1
+                            result.albums += 1
+                            logger.info(
+                                f"Album sent successfully: {len(album_messages)} files"
+                            )
+                        else:
+                            result.failed += 1
+                            logger.error(
+                                f"Album failed: grouped_id={message.grouped_id}"
+                            )
+
+                        # ضع علامة على باقي رسائل الألبوم لتخطّيها
+                        for m in album_messages:
+                            if m.id != message.id:
+                                skip_message_ids.add(m.id)
+
+                elif message.grouped_id and message.grouped_id in processed_albums:
+                    # رسالة ضمن ألبوم تمت معالجته — تخطّيها
+                    result.skipped += 1
+                    continue
+
+                # ── Single Message ────────────────────────────
+
                 else:
-                    result.failed += 1
+                    success = await self._copy_with_retry(
+                        message, dest, config, result
+                    )
+                    if success:
+                        result.success += 1
+                        result.singles += 1
+                    else:
+                        result.failed += 1
 
                 # Progress callback
                 if cb:
@@ -393,10 +480,120 @@ class TelegramForwarder:
             logger.error(f"Forward failed: {e}", exc_info=True)
 
         logger.info(
-            f"Done: {result.success} ok, {result.failed} failed, "
-            f"{result.skipped} skipped — {result.elapsed}"
+            f"Done: {result.success} ok ({result.albums} albums, {result.singles} singles), "
+            f"{result.failed} failed, {result.skipped} skipped — {result.elapsed}"
         )
         return result
+
+    # ── Album Collection ──────────────────────────────────────
+
+    async def _collect_album(
+        self, source, trigger_message: Message
+    ) -> List[Message]:
+        """
+        جمع كل رسائل الألبوم بناءً على grouped_id.
+        يبحث في نطاق ±10 رسائل من رسالة الزناد.
+        """
+        album_messages = []
+        search_range = 10
+
+        async for msg in self.client.iter_messages(
+            source,
+            limit=search_range * 2 + 1,
+            min_id=trigger_message.id - search_range,
+            max_id=trigger_message.id + search_range,
+        ):
+            if msg.grouped_id == trigger_message.grouped_id:
+                album_messages.append(msg)
+
+        # ترتيب حسب ID
+        album_messages.sort(key=lambda m: m.id)
+        logger.info(
+            f"Collected album: grouped_id={trigger_message.grouped_id}, "
+            f"count={len(album_messages)}, "
+            f"IDs={[m.id for m in album_messages]}"
+        )
+        return album_messages
+
+    # ── Album Copy ────────────────────────────────────────────
+
+    async def _copy_album(
+        self,
+        album_messages: List[Message],
+        dest,
+        config: ForwardConfig,
+        result: ForwardResult,
+    ) -> bool:
+        """
+        تنزيل وإرسال ألبوم كاملاً باستخدام send_file مع قائمة ملفات.
+        """
+        album_tmp = TEMP_DIR / f"album_{album_messages[0].grouped_id}_{int(time.time())}"
+        album_tmp.mkdir(parents=True, exist_ok=True)
+
+        try:
+            files: List[str] = []
+            album_caption = ""
+
+            async with DOWNLOAD_SEMAPHORE:
+                for msg in album_messages:
+                    # تخطّي WebPage
+                    if isinstance(getattr(msg, "media", None), MessageMediaWebPage):
+                        if msg.text and not album_caption:
+                            album_caption = (msg.text or "") if config.send_caption else ""
+                        continue
+
+                    if not msg.media:
+                        # نص فقط ضمن الألبوم
+                        if msg.text and not album_caption:
+                            album_caption = (msg.text or "") if config.send_caption else ""
+                        continue
+
+                    try:
+                        file_path = await asyncio.wait_for(
+                            msg.download_media(file=str(album_tmp) + "/"),
+                            timeout=120,
+                        )
+                        if file_path and os.path.exists(file_path):
+                            files.append(file_path)
+                            logger.debug(f"Album file downloaded: {file_path}")
+                        # استخدم نص أول رسالة فيها وسائط كـ caption
+                        if msg.text and not album_caption and config.send_caption:
+                            album_caption = msg.text
+                    except asyncio.TimeoutError:
+                        logger.warning(f"Album file timeout: msg#{msg.id}")
+                        result.errors.append(f"album msg#{msg.id}: timeout تنزيل")
+                    except Exception as e:
+                        logger.warning(f"Album file download failed: msg#{msg.id}: {e}")
+                        result.errors.append(f"album msg#{msg.id}: {e}")
+
+            if not files:
+                # لا توجد ملفات — أرسل النص فقط
+                if album_caption:
+                    await self.client.send_message(dest, album_caption, parse_mode="html")
+                    return True
+                return False
+
+            # إرسال كل الملفات كألبوم واحد
+            await asyncio.wait_for(
+                self.client.send_file(
+                    dest,
+                    files,
+                    caption=album_caption if config.send_caption else "",
+                    parse_mode="html",
+                    force_document=False,
+                ),
+                timeout=300,  # 5 دقائق للألبوم
+            )
+            return True
+
+        except FloodWaitError:
+            raise  # سيتم معالجته في _copy_with_retry
+        except Exception as e:
+            result.errors.append(f"album send: {e}")
+            logger.error(f"Album send failed: {e}", exc_info=True)
+            return False
+        finally:
+            shutil.rmtree(str(album_tmp), ignore_errors=True)
 
     # ── Internal ──────────────────────────────────────────────
 
@@ -453,11 +650,12 @@ class TelegramForwarder:
             msg_tmp.mkdir(parents=True, exist_ok=True)
 
             try:
-                # تنزيل الوسائط
-                file_path = await asyncio.wait_for(
-                    message.download_media(file=str(msg_tmp) + "/"),
-                    timeout=120,  # 2 دقيقة لكل ملف
-                )
+                async with DOWNLOAD_SEMAPHORE:
+                    # تنزيل الوسائط
+                    file_path = await asyncio.wait_for(
+                        message.download_media(file=str(msg_tmp) + "/"),
+                        timeout=120,  # 2 دقيقة لكل ملف
+                    )
 
                 if file_path and os.path.exists(file_path):
                     # رفع كرسالة جديدة
