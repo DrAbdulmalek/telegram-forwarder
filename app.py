@@ -24,6 +24,7 @@ import os
 import sys
 import asyncio
 import shutil
+import threading
 import gradio as gr
 from typing import Optional, Generator
 from pathlib import Path
@@ -33,6 +34,30 @@ from forwarder import (
     TelegramForwarder, ForwardConfig, ForwardResult,
     create_forwarder, TEMP_DIR,
 )
+
+# ─── Persistent Event Loop (fixes "event loop must not change") ───
+
+_loop: Optional[asyncio.AbstractEventLoop] = None
+_loop_lock = threading.Lock()
+
+
+def _get_loop() -> asyncio.AbstractEventLoop:
+    """Return a single persistent event loop running in a daemon thread."""
+    global _loop
+    with _loop_lock:
+        if _loop is None or _loop.is_closed():
+            _loop = asyncio.new_event_loop()
+            t = threading.Thread(target=_loop.run_forever, daemon=True)
+            t.start()
+        return _loop
+
+
+def _run(coro):
+    """Run a coroutine on the persistent event loop (Telethon-safe)."""
+    loop = _get_loop()
+    future = asyncio.run_coroutine_threadsafe(coro, loop)
+    return future.result(timeout=60)
+
 
 # ─── Global State ─────────────────────────────────────────────
 
@@ -100,18 +125,7 @@ CSS = """
 
 # ─── Helpers ──────────────────────────────────────────────────
 
-def _run(coro):
-    """تشغيل coroutine في event loop موجود أو جديد."""
-    try:
-        loop = asyncio.get_event_loop()
-        if loop.is_running():
-            import concurrent.futures
-            with concurrent.futures.ThreadPoolExecutor() as pool:
-                future = pool.submit(asyncio.run, coro)
-                return future.result()
-        return loop.run_until_complete(coro)
-    except RuntimeError:
-        return asyncio.run(coro)
+# _run() moved above — persistent loop version
 
 
 def _status_html(text: str, kind: str = "info") -> str:
@@ -364,6 +378,7 @@ def do_forward(
     yield _status_html("⏳ جارٍ الاتصال بالقنوات…", "info"), 0, "{}"
 
     # Progress tracking عبر asyncio.Queue
+    loop = _get_loop()
     progress_queue = asyncio.Queue()
 
     async def progress_cb(result: ForwardResult, pct: int):
@@ -376,22 +391,16 @@ def do_forward(
         except Exception as e:
             await progress_queue.put(("ERROR", str(e)))
 
-    import threading
-    loop = asyncio.new_event_loop()
-
-    def _thread():
-        asyncio.set_event_loop(loop)
-        loop.run_until_complete(run_forward())
-
-    thread = threading.Thread(target=_thread, daemon=True)
-    thread.start()
+    # Run forward_content on the persistent loop
+    future = asyncio.run_coroutine_threadsafe(run_forward(), loop)
 
     # استقبال التحديثات وإرسالها للـ UI
-    while thread.is_alive() or not progress_queue.empty():
+    import time as _time
+    while not future.done() or not progress_queue.empty():
         try:
             item = progress_queue.get_nowait()
         except Exception:
-            import time; time.sleep(0.5)
+            _time.sleep(0.5)
             continue
 
         if isinstance(item, tuple) and item[0] == "DONE":
@@ -419,7 +428,11 @@ def do_forward(
             )
             yield status, int(pct), str(r.to_dict())
 
-    thread.join()
+    # Wait for completion if loop ended before queue drained
+    try:
+        future.result(timeout=5)
+    except Exception:
+        pass
 
 
 def do_cancel():
