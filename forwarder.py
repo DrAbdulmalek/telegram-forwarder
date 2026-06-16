@@ -286,29 +286,95 @@ class TelegramForwarder:
                 })
         return dialogs
 
-    def _resolve_entity_input(self, channel_id):
-        """تحويل معرّف القناة إلى الصيغة المناسبة لـ get_entity.
-
-        القائمة المنسدلة تُمرّر المعرّفات كنصوص مثل '-1001927197663'.
-        Telethon يحتاجها كأرقام (int) ليعرف نوع الكيان.
+    async def _resolve_entity(self, identifier):
         """
-        if isinstance(channel_id, (int, float)):
-            return int(channel_id)
-        s = str(channel_id).strip()
-        # إذا كان يبدأ بـ @ أو يحرف — مرّره كـ username
-        if s.startswith('@') or not s.lstrip('-').isdigit():
-            return s
-        # معرّف رقمي مثل '-1001927197663' أو '1927197663'
-        return int(s)
+        حلّ معرّف القناة/المستخدم إلى entity صحيح.
+
+        يدعم:
+          - @username
+          - رابط https://t.me/username أو t.me/+invite
+          - ID رقمي خام (مثل -1001927197663) — يحتاج تحويل إلى PeerChannel
+          - ID موجب (channel_id بدون -100) — يُحوَّل تلقائياً
+
+        المشكلة الأصلية: تمرير string لـ ID خام مباشرة إلى get_entity()
+        يفشل لأن Telethon يبحث في session cache المحلي فقط لمعرّفات الأرقام،
+        ولا يعرف نوع الـ Peer (channel/chat/user) بدون استخدام PeerChannel.
+        """
+        if not self.client:
+            raise RuntimeError("Not connected")
+
+        identifier = str(identifier).strip()
+
+        # حالة: رابط t.me
+        if "t.me/" in identifier:
+            identifier = identifier.split("t.me/")[-1].lstrip("@")
+            try:
+                return await self.client.get_entity(identifier)
+            except Exception:
+                pass
+
+        # حالة: @username أو اسم نصي
+        if identifier.startswith("@") or not self._is_numeric_id(identifier):
+            return await self.client.get_entity(identifier)
+
+        # حالة: ID رقمي — قد يكون بصيغة -100xxxxxxxxxx (قناة) أو رقم عضو
+        raw_id = int(identifier)
+
+        # أولاً: جرّب البحث المباشر في الـ dialogs المُخزَّنة (الأسرع والأكثر دقة)
+        try:
+            async for dialog in self.client.iter_dialogs():
+                if dialog.id == raw_id:
+                    return dialog.entity
+        except Exception:
+            pass
+
+        # ثانياً: حوّل بصيغة PeerChannel الصحيحة
+        from telethon.tl.types import PeerChannel, PeerChat, PeerUser
+
+        if raw_id < 0:
+            # صيغة -100xxxxxxxxxx → channel_id الحقيقي بعد إزالة -100
+            id_str = str(raw_id)
+            if id_str.startswith("-100"):
+                channel_id = int(id_str[4:])  # احذف "-100"
+                try:
+                    return await self.client.get_entity(PeerChannel(channel_id))
+                except Exception:
+                    pass
+            else:
+                # مجموعة عادية (-xxxxxxxxx بدون 100)
+                chat_id = abs(raw_id)
+                try:
+                    return await self.client.get_entity(PeerChat(chat_id))
+                except Exception:
+                    pass
+        else:
+            # مستخدم أو channel_id موجب بدون البادئة
+            try:
+                return await self.client.get_entity(PeerChannel(raw_id))
+            except Exception:
+                try:
+                    return await self.client.get_entity(PeerUser(raw_id))
+                except Exception:
+                    pass
+
+        # كحل أخير: مرّر كما هو ودع Telethon يحاول
+        return await self.client.get_entity(raw_id)
+
+    @staticmethod
+    def _is_numeric_id(s: str) -> bool:
+        s = s.strip()
+        if s.startswith("-"):
+            s = s[1:]
+        return s.isdigit()
 
     async def get_channel_info(self, channel_id: str) -> Dict:
         """جلب معلومات قناة محددة."""
         if not self.client:
             raise RuntimeError("Not connected")
-        entity = await self.client.get_entity(self._resolve_entity_input(channel_id))
+        entity = await self._resolve_entity(channel_id)
         return {
             "id":                 entity.id,
-            "title":              entity.title,
+            "title":              getattr(entity, "title", None) or getattr(entity, "first_name", "—"),
             "username":           getattr(entity, "username", None),
             "participants_count": getattr(entity, "participants_count", 0),
             "restricted":         getattr(entity, "restricted", False),
@@ -342,8 +408,8 @@ class TelegramForwarder:
         rate = RateLimiter(base_delay=config.delay)
 
         try:
-            source = await self.client.get_entity(self._resolve_entity_input(config.source_channel))
-            dest   = await self.client.get_entity(self._resolve_entity_input(config.dest_channel))
+            source = await self._resolve_entity(config.source_channel)
+            dest   = await self._resolve_entity(config.dest_channel)
             logger.info(f"Forwarding from '{source.title}' → '{dest.title}'")
 
         except ChannelPrivateError:
