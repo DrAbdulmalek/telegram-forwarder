@@ -143,20 +143,22 @@ def do_send_code(api_id_val, api_hash_val, phone_val, session_str_val):
     phone_val     = str(phone_val).strip()
     session_str_val = str(session_str_val).strip() if session_str_val else ""
 
+    _hide_col = gr.Column(visible=False)
+
     if not api_id_val or not api_hash_val:
         return (
-            gr.update(visible=False),
+            _hide_col,
             _status_html("❌ أدخل API ID و API Hash أولاً", "error"),
-            gr.update(visible=False),
+            _hide_col,
         )
 
     try:
         api_id = int(api_id_val)
     except ValueError:
         return (
-            gr.update(visible=False),
+            _hide_col,
             _status_html("❌ API ID يجب أن يكون رقماً", "error"),
-            gr.update(visible=False),
+            _hide_col,
         )
 
     # قطع الاتصال القديم
@@ -173,33 +175,35 @@ def do_send_code(api_id_val, api_hash_val, phone_val, session_str_val):
     _run(forwarder.create_client())
 
     # هل الجلسة مفعّلة بالفعل؟
+    _show_col = gr.Column(visible=True)
+
     if _run(forwarder.is_authorized()):
         return (
-            gr.update(visible=False),
+            _hide_col,
             _status_html("✅ متصل بنجاح (جلسة محفوظة)!", "success"),
-            gr.update(visible=True),  # أظهر زر تصدير الجلسة
+            _show_col,
         )
 
     # أرسل الكود
     if not phone_val or not phone_val.startswith("+"):
         return (
-            gr.update(visible=False),
+            _hide_col,
             _status_html("❌ أدخل رقم هاتف صالح يبدأ بـ + (مثال: +963XXXXXXXXX)", "error"),
-            gr.update(visible=False),
+            _hide_col,
         )
 
     try:
         _run(forwarder.send_code(phone_val))
         return (
-            gr.update(visible=True),   # أظهر حقل الكود
+            _show_col,
             _status_html("📱 تم إرسال الكود — تحقق من تطبيق Telegram", "info"),
-            gr.update(visible=False),
+            _hide_col,
         )
     except Exception as e:
         return (
-            gr.update(visible=False),
+            _hide_col,
             _status_html(f"❌ {e}", "error"),
-            gr.update(visible=False),
+            _hide_col,
         )
 
 
@@ -208,24 +212,24 @@ def do_verify_code(code_val, password_val):
     global forwarder
 
     if not forwarder:
-        return _status_html("❌ أعد إرسال الكود أولاً", "error"), gr.update(visible=False)
+        return _status_html("❌ أعد إرسال الكود أولاً", "error"), gr.Column(visible=False)
 
     code_val = str(code_val).strip()
     if not code_val:
-        return _status_html("❌ أدخل الكود", "error"), gr.update(visible=False)
+        return _status_html("❌ أدخل الكود", "error"), gr.Column(visible=False)
 
     try:
         _run(forwarder.verify_code(code_val, password_val or None))
         return (
             _status_html("✅ تم تسجيل الدخول بنجاح!", "success"),
-            gr.update(visible=True),  # أظهر زر تصدير الجلسة
+            gr.Column(visible=True),
         )
     except ValueError as e:
         if "2FA_PASSWORD_REQUIRED" in str(e):
-            return _status_html("🔐 أدخل كلمة مرور التحقق الثنائي أعلاه ثم اضغط تأكيد", "warn"), gr.update(visible=False)
-        return _status_html(f"❌ {e}", "error"), gr.update(visible=False)
+            return _status_html("🔐 أدخل كلمة مرور التحقق الثنائي أعلاه ثم اضغط تأكيد", "warn"), gr.Column(visible=False)
+        return _status_html(f"❌ {e}", "error"), gr.Column(visible=False)
     except Exception as e:
-        return _status_html(f"❌ {e}", "error"), gr.update(visible=False)
+        return _status_html(f"❌ {e}", "error"), gr.Column(visible=False)
 
 
 def do_export_session():
@@ -249,17 +253,18 @@ def do_disconnect():
         _run(forwarder.disconnect())
         forwarder = None
     return (
-        gr.update(visible=False),
+        gr.Column(visible=False),
         _status_html("🔌 تم قطع الاتصال", "warn"),
-        gr.update(visible=False),
+        gr.Column(visible=False),
     )
 
 
 def do_refresh():
     """تحديث قائمة القنوات."""
     global forwarder
+    _empty_dd = gr.Dropdown(choices=[])
     if not forwarder or not _run(forwarder.is_authorized()):
-        return gr.update(choices=[]), gr.update(choices=[]), _status_html("❌ غير متصل — سجل دخول أولاً", "error")
+        return _empty_dd, _empty_dd, _status_html("❌ غير متصل — سجل دخول أولاً", "error")
 
     try:
         dialogs = _run(forwarder.get_dialogs())
@@ -269,13 +274,14 @@ def do_refresh():
             label = f"{badge}{d['title']} ({d['type']})"
             choices.append((label, str(d["id"])))
 
+        _dd = gr.Dropdown(choices=choices, value=None, interactive=True)
         return (
-            gr.update(choices=choices, value=None),
-            gr.update(choices=choices, value=None),
+            _dd,
+            _dd,
             _status_html(f"✅ تم تحميل {len(choices)} قناة/مجموعة", "success"),
         )
     except Exception as e:
-        return gr.update(choices=[]), gr.update(choices=[]), _status_html(f"❌ {e}", "error")
+        return _empty_dd, _empty_dd, _status_html(f"❌ {e}", "error")
 
 
 def do_channel_info(channel_id):
