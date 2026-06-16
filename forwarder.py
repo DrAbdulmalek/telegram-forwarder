@@ -286,11 +286,26 @@ class TelegramForwarder:
                 })
         return dialogs
 
+    def _resolve_entity_input(self, channel_id):
+        """تحويل معرّف القناة إلى الصيغة المناسبة لـ get_entity.
+
+        القائمة المنسدلة تُمرّر المعرّفات كنصوص مثل '-1001927197663'.
+        Telethon يحتاجها كأرقام (int) ليعرف نوع الكيان.
+        """
+        if isinstance(channel_id, (int, float)):
+            return int(channel_id)
+        s = str(channel_id).strip()
+        # إذا كان يبدأ بـ @ أو يحرف — مرّره كـ username
+        if s.startswith('@') or not s.lstrip('-').isdigit():
+            return s
+        # معرّف رقمي مثل '-1001927197663' أو '1927197663'
+        return int(s)
+
     async def get_channel_info(self, channel_id: str) -> Dict:
         """جلب معلومات قناة محددة."""
         if not self.client:
             raise RuntimeError("Not connected")
-        entity = await self.client.get_entity(channel_id)
+        entity = await self.client.get_entity(self._resolve_entity_input(channel_id))
         return {
             "id":                 entity.id,
             "title":              entity.title,
@@ -327,8 +342,8 @@ class TelegramForwarder:
         rate = RateLimiter(base_delay=config.delay)
 
         try:
-            source = await self.client.get_entity(config.source_channel)
-            dest   = await self.client.get_entity(config.dest_channel)
+            source = await self.client.get_entity(self._resolve_entity_input(config.source_channel))
+            dest   = await self.client.get_entity(self._resolve_entity_input(config.dest_channel))
             logger.info(f"Forwarding from '{source.title}' → '{dest.title}'")
 
         except ChannelPrivateError:
