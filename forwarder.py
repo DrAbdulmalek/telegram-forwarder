@@ -171,8 +171,20 @@ class TelegramForwarder:
         else:
             session = self.session_name
 
+        # ملاحظة تقنية مؤكَّدة بالاختبار على المصدر الفعلي لـ Telethon 1.36:
+        # TelegramClient._loop يُسجَّل تلقائياً عبر helpers.get_running_loop()
+        # في أول connect() فقط، ثم client.loop (property) يُعيد قراءته
+        # عبر get_running_loop() عند كل استخدام لاحق. هذا يعني أن السلامة
+        # الكاملة تعتمد فقط على كون create_client() (وكل عملية لاحقة على
+        # هذا client) تُنفَّذ دائماً ضمن نفس الـ loop الثابت — وهو مضمون
+        # في app.py عبر تمرير كل العمليات على run_coroutine_threadsafe(_loop).
+        # معامل loop= هنا للتوثيق الصريح فقط؛ Telethon 1.36 لا يعتمد عليه
+        # فعلياً (self._loop يبدأ None ويُحدَّد ذاتياً عند connect()).
+        current_loop = asyncio.get_event_loop()
+
         self.client = TelegramClient(
             session, self.api_id, self.api_hash,
+            loop=current_loop,
             catch_up=False,           # لا تُزامن الرسائل الفائتة تلقائياً
             sequential_updates=True,  # يقلّل الطلبات المتزامنة عند الاتصال
         )
