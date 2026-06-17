@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Content Forwarder — Gradio UI v2.1
+Telegram Content Forwarder — Gradio UI v2
 ==========================================
 تحسينات عن النسخة الأولى:
   1. شريط تقدم حقيقي يتحدث لحظياً (Generator-based)
@@ -12,67 +12,40 @@ Telegram Content Forwarder — Gradio UI v2.1
   6. معالجة أفضل لأخطاء API ID/Hash
   7. إضافة tab "الإحصائيات" لعرض نتائج آخر عملية
   8. تحذير عند اختيار تأخير < 1 ثانية
-
-تحسينات v2.1:
-  9. تبويب "الإحصائيات" مع عرض مفصّل (ألبومات / منفردة / أخطاء)
-  10. زر "تنظيف المجلد المؤقت" للصيانة
-  11. عرض معلومات القناة المصدر والوجهة قبل النقل
-  12. تحسينات بصرية ورسائل أوضح
 """
 
 import os
 import sys
 import asyncio
-import shutil
 import threading
 import gradio as gr
 from typing import Optional, Generator
-from pathlib import Path
 
 sys.path.insert(0, os.path.dirname(__file__))
-from forwarder import (
-    TelegramForwarder, ForwardConfig, ForwardResult,
-    create_forwarder, TEMP_DIR,
-)
-
-# ─── Persistent Settings (HF Secrets → Env Vars) ─────────────
-# احفظ هذه القيم في HuggingFace Secrets:
-#   SESSION_STRING, API_ID, API_HASH, SOURCE_CHANNEL, DEST_CHANNEL
-
-ENV_API_ID         = os.environ.get("API_ID", "")
-ENV_API_HASH       = os.environ.get("API_HASH", "")
-ENV_SESSION_STRING = os.environ.get("SESSION_STRING", "")
-ENV_SOURCE_CHANNEL = os.environ.get("SOURCE_CHANNEL", "")
-ENV_DEST_CHANNEL   = os.environ.get("DEST_CHANNEL", "")
-
-# ─── Persistent Event Loop (fixes "event loop must not change") ───
-
-_loop: Optional[asyncio.AbstractEventLoop] = None
-_loop_lock = threading.Lock()
-
-
-def _get_loop() -> asyncio.AbstractEventLoop:
-    """Return a single persistent event loop running in a daemon thread."""
-    global _loop
-    with _loop_lock:
-        if _loop is None or _loop.is_closed():
-            _loop = asyncio.new_event_loop()
-            t = threading.Thread(target=_loop.run_forever, daemon=True)
-            t.start()
-        return _loop
-
-
-def _run(coro):
-    """Run a coroutine on the persistent event loop (Telethon-safe)."""
-    loop = _get_loop()
-    future = asyncio.run_coroutine_threadsafe(coro, loop)
-    return future.result(timeout=60)
-
+from forwarder import TelegramForwarder, ForwardConfig, ForwardResult, create_forwarder
 
 # ─── Global State ─────────────────────────────────────────────
 
 forwarder: Optional[TelegramForwarder] = None
 last_result: Optional[ForwardResult]   = None
+
+# ─── Persistent Event Loop ────────────────────────────────────
+# مشكلة جذرية أصلية: كل نداء _run() كان يُنشئ event loop جديداً عبر
+# asyncio.run() في ThreadPoolExecutor مؤقت. لكن TelegramClient يربط
+# نفسه داخلياً بـ event loop واحد عند connect() — استخدامه من loop
+# مختلف لاحقاً (كما كان يحدث بين do_send_code وdo_refresh وdo_forward)
+# يُسبب أعطالاً صامتة أو استثناءات غامضة حتى لو كان المنطق سليماً.
+# الحل: thread واحد يعيش طوال عمر التطبيق مع event loop ثابت واحد،
+# وكل العمليات (login, dialogs, forward) تُنفَّذ عليه فقط.
+
+_loop = asyncio.new_event_loop()
+
+def _loop_runner():
+    asyncio.set_event_loop(_loop)
+    _loop.run_forever()
+
+_loop_thread = threading.Thread(target=_loop_runner, daemon=True)
+_loop_thread.start()
 
 # ─── CSS ──────────────────────────────────────────────────────
 
@@ -110,94 +83,22 @@ CSS = """
     border: 1px solid #9ec5fe; border-radius: 10px;
     padding: 12px 16px; margin: 8px 0;
 }
-
-.stat-card {
-    display: inline-block;
-    background: #f8f9fa;
-    border: 1px solid #dee2e6;
-    border-radius: 10px;
-    padding: 16px 24px;
-    margin: 6px;
-    text-align: center;
-    min-width: 120px;
-}
-.stat-card .stat-number {
-    font-size: 2em;
-    font-weight: 700;
-    color: #1a73e8;
-}
-.stat-card .stat-label {
-    font-size: .85em;
-    color: #6c757d;
-    margin-top: 4px;
-}
 """
 
 # ─── Helpers ──────────────────────────────────────────────────
 
-# _run() moved above — persistent loop version
+def _run(coro):
+    """
+    شغّل أي coroutine دائماً على الـ event loop الثابت الوحيد (_loop).
+    هذا يضمن أن TelegramClient يُستخدم دائماً من نفس الـ loop الذي
+    اتصل (connect) ضمنه — وهو شرط أساسي لعمل Telethon بشكل صحيح.
+    """
+    future = asyncio.run_coroutine_threadsafe(coro, _loop)
+    return future.result()
 
 
 def _status_html(text: str, kind: str = "info") -> str:
     return f'<div class="{kind}-box">{text}</div>'
-
-
-def _auto_connect():
-    """اتصال تلقائي عند تحميل الصفحة إذا توفرت بيانات HF Secrets.
-
-    يُستدعى مرة واحدة عبر app.load. إذا توفر SESSION_STRING + API_ID + API_HASH
-    يتصل تلقائياً ويُحدّث حالة الواجهة.
-    """
-    global forwarder
-
-    if not ENV_API_ID or not ENV_API_HASH or not ENV_SESSION_STRING:
-        return (
-            gr.Column(visible=False),
-            _status_html("غير متصل 🔴 — أدخل بيانات الدخول أو أضف HF Secrets", "warn"),
-            gr.Column(visible=False),
-        )
-
-    try:
-        api_id = int(ENV_API_ID)
-    except ValueError:
-        return (
-            gr.Column(visible=False),
-            _status_html("❌ API_ID في Env غير صحيح", "error"),
-            gr.Column(visible=False),
-        )
-
-    # قطع اتصال سابق إن وُجد
-    if forwarder:
-        try:
-            _run(forwarder.disconnect())
-        except Exception:
-            pass
-
-    try:
-        forwarder = create_forwarder(
-            api_id, ENV_API_HASH,
-            session_string=ENV_SESSION_STRING,
-        )
-        _run(forwarder.create_client())
-
-        if _run(forwarder.is_authorized()):
-            return (
-                gr.Column(visible=False),
-                _status_html("✅ متصل تلقائياً (إعدادات محفوظة)!", "success"),
-                gr.Column(visible=True),
-            )
-        else:
-            return (
-                gr.Column(visible=False),
-                _status_html("⚠️ الجلسة منتهية — أعد تصدير SESSION_STRING", "warn"),
-                gr.Column(visible=False),
-            )
-    except Exception as e:
-        return (
-            gr.Column(visible=False),
-            _status_html(f"❌ فشل الاتصال التلقائي: {e}", "error"),
-            gr.Column(visible=False),
-        )
 
 
 # ─── Event Handlers ───────────────────────────────────────────
@@ -211,22 +112,20 @@ def do_send_code(api_id_val, api_hash_val, phone_val, session_str_val):
     phone_val     = str(phone_val).strip()
     session_str_val = str(session_str_val).strip() if session_str_val else ""
 
-    _hide_col = gr.Column(visible=False)
-
     if not api_id_val or not api_hash_val:
         return (
-            _hide_col,
+            gr.update(visible=False),
             _status_html("❌ أدخل API ID و API Hash أولاً", "error"),
-            _hide_col,
+            gr.update(visible=False),
         )
 
     try:
         api_id = int(api_id_val)
     except ValueError:
         return (
-            _hide_col,
+            gr.update(visible=False),
             _status_html("❌ API ID يجب أن يكون رقماً", "error"),
-            _hide_col,
+            gr.update(visible=False),
         )
 
     # قطع الاتصال القديم
@@ -243,35 +142,33 @@ def do_send_code(api_id_val, api_hash_val, phone_val, session_str_val):
     _run(forwarder.create_client())
 
     # هل الجلسة مفعّلة بالفعل؟
-    _show_col = gr.Column(visible=True)
-
     if _run(forwarder.is_authorized()):
         return (
-            _hide_col,
+            gr.update(visible=False),
             _status_html("✅ متصل بنجاح (جلسة محفوظة)!", "success"),
-            _show_col,
+            gr.update(visible=True),  # أظهر زر تصدير الجلسة
         )
 
     # أرسل الكود
     if not phone_val or not phone_val.startswith("+"):
         return (
-            _hide_col,
+            gr.update(visible=False),
             _status_html("❌ أدخل رقم هاتف صالح يبدأ بـ + (مثال: +963XXXXXXXXX)", "error"),
-            _hide_col,
+            gr.update(visible=False),
         )
 
     try:
         _run(forwarder.send_code(phone_val))
         return (
-            _show_col,
+            gr.update(visible=True),   # أظهر حقل الكود
             _status_html("📱 تم إرسال الكود — تحقق من تطبيق Telegram", "info"),
-            _hide_col,
+            gr.update(visible=False),
         )
     except Exception as e:
         return (
-            _hide_col,
+            gr.update(visible=False),
             _status_html(f"❌ {e}", "error"),
-            _hide_col,
+            gr.update(visible=False),
         )
 
 
@@ -280,24 +177,24 @@ def do_verify_code(code_val, password_val):
     global forwarder
 
     if not forwarder:
-        return _status_html("❌ أعد إرسال الكود أولاً", "error"), gr.Column(visible=False)
+        return _status_html("❌ أعد إرسال الكود أولاً", "error"), gr.update(visible=False)
 
     code_val = str(code_val).strip()
     if not code_val:
-        return _status_html("❌ أدخل الكود", "error"), gr.Column(visible=False)
+        return _status_html("❌ أدخل الكود", "error"), gr.update(visible=False)
 
     try:
         _run(forwarder.verify_code(code_val, password_val or None))
         return (
             _status_html("✅ تم تسجيل الدخول بنجاح!", "success"),
-            gr.Column(visible=True),
+            gr.update(visible=True),  # أظهر زر تصدير الجلسة
         )
     except ValueError as e:
         if "2FA_PASSWORD_REQUIRED" in str(e):
-            return _status_html("🔐 أدخل كلمة مرور التحقق الثنائي أعلاه ثم اضغط تأكيد", "warn"), gr.Column(visible=False)
-        return _status_html(f"❌ {e}", "error"), gr.Column(visible=False)
+            return _status_html("🔐 أدخل كلمة مرور التحقق الثنائي أعلاه ثم اضغط تأكيد", "warn"), gr.update(visible=False)
+        return _status_html(f"❌ {e}", "error"), gr.update(visible=False)
     except Exception as e:
-        return _status_html(f"❌ {e}", "error"), gr.Column(visible=False)
+        return _status_html(f"❌ {e}", "error"), gr.update(visible=False)
 
 
 def do_export_session():
@@ -321,18 +218,17 @@ def do_disconnect():
         _run(forwarder.disconnect())
         forwarder = None
     return (
-        gr.Column(visible=False),
+        gr.update(visible=False),
         _status_html("🔌 تم قطع الاتصال", "warn"),
-        gr.Column(visible=False),
+        gr.update(visible=False),
     )
 
 
 def do_refresh():
     """تحديث قائمة القنوات."""
     global forwarder
-    _empty_dd = gr.Dropdown(choices=[])
     if not forwarder or not _run(forwarder.is_authorized()):
-        return _empty_dd, _empty_dd, _status_html("❌ غير متصل — سجل دخول أولاً", "error")
+        return gr.update(choices=[]), gr.update(choices=[]), _status_html("❌ غير متصل — سجل دخول أولاً", "error")
 
     try:
         dialogs = _run(forwarder.get_dialogs())
@@ -342,14 +238,13 @@ def do_refresh():
             label = f"{badge}{d['title']} ({d['type']})"
             choices.append((label, str(d["id"])))
 
-        _dd = gr.Dropdown(choices=choices, value=None, interactive=True)
         return (
-            _dd,
-            _dd,
+            gr.update(choices=choices, value=None),
+            gr.update(choices=choices, value=None),
             _status_html(f"✅ تم تحميل {len(choices)} قناة/مجموعة", "success"),
         )
     except Exception as e:
-        return _empty_dd, _empty_dd, _status_html(f"❌ {e}", "error")
+        return gr.update(choices=[]), gr.update(choices=[]), _status_html(f"❌ {e}", "error")
 
 
 def do_channel_info(channel_id):
@@ -360,51 +255,18 @@ def do_channel_info(channel_id):
     try:
         info = _run(forwarder.get_channel_info(channel_id))
         protected = "🔒 نعم" if info.get("protected") else "✅ لا"
-        restricted = "⛔ نعم" if info.get("restricted") else "✅ لا"
-        members = info.get("participants_count") or "غير معروف"
-        username = info.get("username") or "بدون @username"
         return (
-            f"**{info['title']}**\n\n"
-            f"| الخاصية | القيمة |\n"
-            f"|---|---|\n"
-            f"| الأعضاء | {members} |\n"
-            f"| @username | @{username} |\n"
-            f"| محتوى محمي | {protected} |\n"
-            f"| مقيد | {restricted} |"
+            f"**{info['title']}** | "
+            f"الأعضاء: {info['participants_count']:,} | "
+            f"المحتوى محمي: {protected}"
         )
+    except RuntimeError as e:
+        if "⏳" in str(e):
+            # FloodWait — ليس خطأ حرج، فقط أخبر المستخدم بهدوء دون تعطيل الواجهة
+            return f"_⏳ تعذّر عرض تفاصيل القناة مؤقتاً (حد Telegram) — يمكنك المتابعة للنقل مباشرة._"
+        return f"⚠️ {e}"
     except Exception:
         return ""
-
-
-def do_pre_forward_info(source_val, dest_val, source_manual_val, dest_manual_val):
-    """عرض ملخص القنوات قبل بدء النقل."""
-    global forwarder
-    if not forwarder or not _run(forwarder.is_authorized()):
-        return _status_html("❌ غير متصل", "error")
-
-    source = (source_manual_val or "").strip() or source_val
-    dest   = (dest_manual_val or "").strip() or dest_val
-
-    if not source or not dest:
-        return _status_html("❌ اختر القناة المصدر والوجهة أولاً", "error")
-
-    try:
-        src_info = _run(forwarder.get_channel_info(source))
-        dst_info = _run(forwarder.get_channel_info(dest))
-
-        src_protected = "🔒 محمي" if src_info.get("protected") else "✅ عادي"
-        dst_protected = "🔒 محمي" if dst_info.get("protected") else "✅ عادي"
-        src_members = src_info.get('participants_count') or "غير معروف"
-        dst_members = dst_info.get('participants_count') or "غير معروف"
-
-        return _status_html(
-            f"📥 **المصدر**: {src_info['title']} ({src_members} عضو, {src_protected})<br>"
-            f"📤 **الوجهة**: {dst_info['title']} ({dst_members} عضو, {dst_protected})<br>"
-            f"{'⚠️ سيتم استخدام تقنية Download-Upload لتجاوز حماية المحتوى' if src_info.get('protected') else '✅ المحتوى غير محمي — النقل عادي'}",
-            "info"
-        )
-    except Exception as e:
-        return _status_html(f"❌ تعذّر جلب المعلومات: {e}", "error")
 
 
 def do_forward(
@@ -453,30 +315,33 @@ def do_forward(
 
     yield _status_html("⏳ جارٍ الاتصال بالقنوات…", "info"), 0, "{}"
 
-    # Progress tracking عبر asyncio.Queue
-    loop = _get_loop()
-    progress_queue = asyncio.Queue()
+    # Progress tracking — Queue عادية (thread-safe) بدل asyncio.Queue
+    # لأن المُستهلك يعمل في الـ thread الرئيسي لـ Gradio وليس داخل _loop
+    import queue as _queue_mod
+    progress_queue: "_queue_mod.Queue" = _queue_mod.Queue()
+
+    def progress_cb_sync(result: ForwardResult, pct: int):
+        progress_queue.put((result, pct))
 
     async def progress_cb(result: ForwardResult, pct: int):
-        await progress_queue.put((result, pct))
+        # نُستدعى من داخل _loop — مرّر التحديث بأمان إلى queue عادية
+        progress_cb_sync(result, pct)
 
     async def run_forward():
         try:
             result = await forwarder.forward_content(config, progress_callback=progress_cb)
-            await progress_queue.put(("DONE", result))
+            progress_queue.put(("DONE", result))
         except Exception as e:
-            await progress_queue.put(("ERROR", str(e)))
+            progress_queue.put(("ERROR", str(e)))
 
-    # Run forward_content on the persistent loop
-    future = asyncio.run_coroutine_threadsafe(run_forward(), loop)
+    # جدوِل التنفيذ على الـ loop الثابت — لا تُنشئ loop جديداً أبداً
+    asyncio.run_coroutine_threadsafe(run_forward(), _loop)
 
-    # استقبال التحديثات وإرسالها للـ UI
-    import time as _time
-    while not future.done() or not progress_queue.empty():
+    # استقبال التحديثات وإرسالها للـ UI (في الـ thread الرئيسي لـ Gradio)
+    while True:
         try:
-            item = progress_queue.get_nowait()
-        except Exception:
-            _time.sleep(0.5)
+            item = progress_queue.get(timeout=0.5)
+        except _queue_mod.Empty:
             continue
 
         if isinstance(item, tuple) and item[0] == "DONE":
@@ -498,17 +363,10 @@ def do_forward(
             status = _status_html(
                 f"⏳ جارٍ النقل — "
                 f"نجح: {r.success} | فشل: {r.failed} | تخطى: {r.skipped} | "
-                f"الألبومات: {r.albums} | "
                 f"الإجمالي: {r.total}/{config.limit}",
                 "info"
             )
             yield status, int(pct), str(r.to_dict())
-
-    # Wait for completion if loop ended before queue drained
-    try:
-        future.result(timeout=5)
-    except Exception:
-        pass
 
 
 def do_cancel():
@@ -516,50 +374,6 @@ def do_cancel():
     if forwarder:
         forwarder.cancel()
     return _status_html("⛔ تم إرسال أمر الإلغاء…", "warn")
-
-
-def do_clear_temp():
-    """تنظيف المجلد المؤقت."""
-    try:
-        if TEMP_DIR.exists():
-            count = sum(1 for _ in TEMP_DIR.rglob("*") if _.is_file())
-            shutil.rmtree(str(TEMP_DIR), ignore_errors=True)
-            TEMP_DIR.mkdir(parents=True, exist_ok=True)
-            if count > 0:
-                return _status_html(f"🧹 تم حذف {count} ملف مؤقت", "success")
-            return _status_html("🧹 المجلد المؤقت نظيف بالفعل", "info")
-        return _status_html("🧹 المجلد المؤقت غير موجود", "info")
-    except Exception as e:
-        return _status_html(f"❌ فشل التنظيف: {e}", "error")
-
-
-def do_show_stats():
-    """عرض إحصائيات آخر عملية نقل."""
-    global last_result
-    if not last_result:
-        return (
-            _status_html("لا توجد عمليات سابقة", "info"),
-            "{}",
-        )
-
-    r = last_result
-    status_text = f"**نتيجة آخر عملية نقل**\n\n"
-    status_text += f"| المقياس | القيمة |\n"
-    status_text += f"|---|---|\n"
-    status_text += f"| الإجمالي | {r.total} |\n"
-    status_text += f"| نجح | ✅ {r.success} |\n"
-    status_text += f"| فشل | ❌ {r.failed} |\n"
-    status_text += f"| تخطّى | ⏭️ {r.skipped} |\n"
-    status_text += f"| ألبومات | 🖼️ {r.albums} |\n"
-    status_text += f"| رسائل منفردة | 📄 {r.singles} |\n"
-    status_text += f"| الوقت | ⏱️ {r.elapsed} |\n"
-
-    if r.cancelled:
-        status_text += f"| الحالة | ⛔ مُلغاة |\n"
-    else:
-        status_text += f"| الحالة | ✅ مكتملة |\n"
-
-    return status_text, str(r.to_dict())
 
 
 # ─── UI ───────────────────────────────────────────────────────
@@ -570,7 +384,7 @@ def build_app():
         gr.HTML("""
         <div class="header">
             <h1>📨 Telegram Content Forwarder</h1>
-            <p>نقل محتوى القنوات المقيدة باستخدام Userbot — v2.1</p>
+            <p>نقل محتوى القنوات المقيدة باستخدام Userbot — v2.0</p>
         </div>
         """)
 
@@ -588,8 +402,8 @@ def build_app():
                 </div>""")
 
                 with gr.Row():
-                    api_id   = gr.Number(label="API ID",   value=int(ENV_API_ID) if ENV_API_ID else 0, precision=0, minimum=1)
-                    api_hash = gr.Textbox(label="API Hash", type="password", placeholder="abc123def456...", value=ENV_API_HASH)
+                    api_id   = gr.Number(label="API ID",   value=0, precision=0, minimum=1)
+                    api_hash = gr.Textbox(label="API Hash", type="password", placeholder="abc123def456...")
 
                 phone = gr.Textbox(
                     label="رقم الهاتف (مع كود الدولة)",
@@ -607,7 +421,7 @@ def build_app():
                         label="Session String (اختياري)",
                         placeholder="1BVtsOK...",
                         type="password",
-                        value=ENV_SESSION_STRING,
+                        value=os.environ.get("SESSION_STRING", ""),
                     )
 
                 with gr.Row():
@@ -642,18 +456,14 @@ def build_app():
                     with gr.Column():
                         gr.Markdown("#### 📥 القناة المصدر")
                         source_list   = gr.Dropdown(choices=[], label="اختر من القائمة", interactive=True)
-                        source_manual = gr.Textbox(label="أو أدخل يدوياً (@username أو ID)", placeholder="@channel_name", value=ENV_SOURCE_CHANNEL)
+                        source_manual = gr.Textbox(label="أو أدخل يدوياً (@username أو ID)", placeholder="@channel_name")
                         source_info   = gr.Markdown()
 
                     with gr.Column():
                         gr.Markdown("#### 📤 القناة الوجهة")
                         dest_list   = gr.Dropdown(choices=[], label="اختر من القائمة", interactive=True)
-                        dest_manual = gr.Textbox(label="أو أدخل يدوياً", placeholder="@my_channel", value=ENV_DEST_CHANNEL)
+                        dest_manual = gr.Textbox(label="أو أدخل يدوياً", placeholder="@my_channel")
                         dest_info   = gr.Markdown()
-
-                # ملخص قبل النقل
-                pre_forward_info = gr.HTML()
-                check_info_btn = gr.Button("🔍 عرض معلومات القنوات", variant="secondary")
 
                 gr.HTML("""<div class="warn-box">
                     ⚠️ القنوات المُشار إليها بـ 🔒 لديها محتوى محمي —
@@ -705,81 +515,47 @@ def build_app():
                 stats_out      = gr.Code(label="آخر نتيجة (JSON)", language="json", value="{}")
 
             # ══════════════════════════════════════════════
-            # TAB 5: الإحصائيات
-            # ══════════════════════════════════════════════
-            with gr.Tab("📊 الإحصائيات"):
-
-                gr.Markdown("### نتائج آخر عملية نقل")
-
-                with gr.Row():
-                    show_stats_btn = gr.Button("📊 عرض الإحصائيات", variant="secondary")
-                    clear_temp_btn = gr.Button("🧹 تنظيف المجلد المؤقت", variant="secondary")
-
-                stats_display = gr.Markdown("لا توجد عمليات سابقة")
-                stats_json    = gr.Code(label="بيانات JSON كاملة", language="json", value="{}")
-                maintenance_status = gr.HTML()
-
-            # ══════════════════════════════════════════════
-            # TAB 6: المساعدة
+            # TAB 5: المساعدة
             # ══════════════════════════════════════════════
             with gr.Tab("❓ المساعدة"):
                 gr.Markdown("""
-## ⚡ الطريقة السريعة (موصى بها لـ HuggingFace)
-
-أضف هذه القيم في **Settings → Secrets** بالـ Space:
-
-| الاسم | القيمة | مطلوب؟ |
-|---|---|---|
-| `API_ID` | رقم API ID من my.telegram.org | ✅ |
-| `API_HASH` | نص API Hash | ✅ |
-| `SESSION_STRING` | نص الجلسة المُصدَّرة | ✅ |
-| `SOURCE_CHANNEL` | @username أو ID القناة المصدر | ❌ |
-| `DEST_CHANNEL` | @username أو ID القناة الوجهة | ❌ |
-
-عند حفظها وإعادة تشغيل Space → يتم الاتصال **تلقائياً**!
-
----
-
-## الطريقة اليدوية
+## كيفية الاستخدام
 
 ### الخطوة 1 — تسجيل الدخول
 1. اذهب إلى [my.telegram.org](https://my.telegram.org)
-2. سجل دخول → **API development tools** → أنشئ تطبيقاً
-3. أدخل **API ID** و **API Hash** واضغط **إرسال كود التحقق**
-4. أدخل الكود المُرسَل إلى Telegram واضغط **تأكيد**
-5. اضغط **تصدير الجلسة** واحفظها في HF Secrets باسم `SESSION_STRING`
+2. سجل دخول بحسابك → **API development tools** → أنشئ تطبيقاً
+3. أدخل **API ID** و **API Hash** في التبويب الأول
+4. أدخل رقم هاتفك واضغط **إرسال كود التحقق**
+5. أدخل الكود المُرسَل إلى Telegram واضغط **تأكيد**
 
-### الخطوة 2 — اختيار القنوات
-- اضغط **تحديث قائمة القنوات** (أو أدخل @username يدوياً)
-- اختر المصدر والوجهة → اضغط **عرض معلومات القنوات**
+### الخطوة 2 — حفظ الجلسة (مهم لـ HuggingFace)
+بعد تسجيل الدخول، اضغط **تصدير الجلسة كـ String** واحفظ النتيجة في:
+`Settings → Secrets → SESSION_STRING`
+هذا يمنع الحاجة لإعادة تسجيل الدخول في كل مرة.
 
-### الخطوة 3 — بدء النقل
+### الخطوة 3 — اختيار القنوات
+- اضغط **تحديث قائمة القنوات**
+- اختر المصدر (القناة المقيدة) والوجهة (قناتك الخاصة)
+
+### الخطوة 4 — ضبط الإعدادات والنقل
 - حدد عدد الرسائل والتأخير (2 ثانية موصى بها)
 - اضغط **بدء النقل**
 
 ---
 
-## كيف يعمل؟
-بدلاً من **Forward** العادي المُقيَّد بـ "Restrict Saving Content"،
+### كيف يعمل؟
+بدلاً من **Forward** العادي الذي يُمنع بواسطة "Restrict Saving Content"،
 يستخدم التطبيق تقنية **Download-Upload**:
 1. يُنزّل الوسائط إلى ذاكرة مؤقتة
 2. يُعيد رفعها كرسائل جديدة
 3. يحذف الملفات المؤقتة فوراً
 
-## دعم الألبومات (v2.1)
-يكتشف تلقائياً الرسائل المجمّعة (Albums/MediaGroups) وينقلها كألبوم واحد.
-
-## نصائح للاستخدام الآمن
-- تأخير لا يقل عن **2 ثانية** | لا أكثر من **500 رسالة** بالجلسة
+### نصائح للاستخدام الآمن
+- استخدم تأخيراً لا يقل عن **2 ثانية**
+- لا تنقل أكثر من **500 رسالة** في الجلسة الواحدة
+- استرح بين العمليات المتكررة
 - **لا تُشارك Session String** مع أي أحد
-- نظّف المجلد المؤقت من تبويب الإحصائيات
                 """)
-
-        # ── Auto-connect on page load ───────────────────────
-        app.load(
-            _auto_connect,
-            outputs=[code_section, login_status, export_section],
-        )
 
         # ── Wire Events ───────────────────────────────────────
 
@@ -811,13 +587,6 @@ def build_app():
         source_list.change(do_channel_info, inputs=[source_list], outputs=[source_info])
         dest_list.change(do_channel_info,   inputs=[dest_list],   outputs=[dest_info])
 
-        # Pre-forward info
-        check_info_btn.click(
-            do_pre_forward_info,
-            inputs=[source_list, dest_list, source_manual, dest_manual],
-            outputs=[pre_forward_info],
-        )
-
         # Forward
         start_btn.click(
             do_forward,
@@ -830,16 +599,6 @@ def build_app():
             outputs=[forward_status, progress_bar, stats_out],
         )
         cancel_btn.click(do_cancel, outputs=[forward_status])
-
-        # Statistics
-        show_stats_btn.click(
-            do_show_stats,
-            outputs=[stats_display, stats_json],
-        )
-        clear_temp_btn.click(
-            do_clear_temp,
-            outputs=[maintenance_status],
-        )
 
     return app
 
