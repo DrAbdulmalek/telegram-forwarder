@@ -35,6 +35,16 @@ from forwarder import (
     create_forwarder, TEMP_DIR,
 )
 
+# ─── Persistent Settings (HF Secrets → Env Vars) ─────────────
+# احفظ هذه القيم في HuggingFace Secrets:
+#   SESSION_STRING, API_ID, API_HASH, SOURCE_CHANNEL, DEST_CHANNEL
+
+ENV_API_ID         = os.environ.get("API_ID", "")
+ENV_API_HASH       = os.environ.get("API_HASH", "")
+ENV_SESSION_STRING = os.environ.get("SESSION_STRING", "")
+ENV_SOURCE_CHANNEL = os.environ.get("SOURCE_CHANNEL", "")
+ENV_DEST_CHANNEL   = os.environ.get("DEST_CHANNEL", "")
+
 # ─── Persistent Event Loop (fixes "event loop must not change") ───
 
 _loop: Optional[asyncio.AbstractEventLoop] = None
@@ -130,6 +140,64 @@ CSS = """
 
 def _status_html(text: str, kind: str = "info") -> str:
     return f'<div class="{kind}-box">{text}</div>'
+
+
+def _auto_connect():
+    """اتصال تلقائي عند تحميل الصفحة إذا توفرت بيانات HF Secrets.
+
+    يُستدعى مرة واحدة عبر app.load. إذا توفر SESSION_STRING + API_ID + API_HASH
+    يتصل تلقائياً ويُحدّث حالة الواجهة.
+    """
+    global forwarder
+
+    if not ENV_API_ID or not ENV_API_HASH or not ENV_SESSION_STRING:
+        return (
+            gr.Column(visible=False),
+            _status_html("غير متصل 🔴 — أدخل بيانات الدخول أو أضف HF Secrets", "warn"),
+            gr.Column(visible=False),
+        )
+
+    try:
+        api_id = int(ENV_API_ID)
+    except ValueError:
+        return (
+            gr.Column(visible=False),
+            _status_html("❌ API_ID في Env غير صحيح", "error"),
+            gr.Column(visible=False),
+        )
+
+    # قطع اتصال سابق إن وُجد
+    if forwarder:
+        try:
+            _run(forwarder.disconnect())
+        except Exception:
+            pass
+
+    try:
+        forwarder = create_forwarder(
+            api_id, ENV_API_HASH,
+            session_string=ENV_SESSION_STRING,
+        )
+        _run(forwarder.create_client())
+
+        if _run(forwarder.is_authorized()):
+            return (
+                gr.Column(visible=False),
+                _status_html("✅ متصل تلقائياً (إعدادات محفوظة)!", "success"),
+                gr.Column(visible=True),
+            )
+        else:
+            return (
+                gr.Column(visible=False),
+                _status_html("⚠️ الجلسة منتهية — أعد تصدير SESSION_STRING", "warn"),
+                gr.Column(visible=False),
+            )
+    except Exception as e:
+        return (
+            gr.Column(visible=False),
+            _status_html(f"❌ فشل الاتصال التلقائي: {e}", "error"),
+            gr.Column(visible=False),
+        )
 
 
 # ─── Event Handlers ───────────────────────────────────────────
@@ -518,8 +586,8 @@ def build_app():
                 </div>""")
 
                 with gr.Row():
-                    api_id   = gr.Number(label="API ID",   value=0, precision=0, minimum=1)
-                    api_hash = gr.Textbox(label="API Hash", type="password", placeholder="abc123def456...")
+                    api_id   = gr.Number(label="API ID",   value=int(ENV_API_ID) if ENV_API_ID else 0, precision=0, minimum=1)
+                    api_hash = gr.Textbox(label="API Hash", type="password", placeholder="abc123def456...", value=ENV_API_HASH)
 
                 phone = gr.Textbox(
                     label="رقم الهاتف (مع كود الدولة)",
@@ -537,7 +605,7 @@ def build_app():
                         label="Session String (اختياري)",
                         placeholder="1BVtsOK...",
                         type="password",
-                        value=os.environ.get("SESSION_STRING", ""),
+                        value=ENV_SESSION_STRING,
                     )
 
                 with gr.Row():
@@ -572,13 +640,13 @@ def build_app():
                     with gr.Column():
                         gr.Markdown("#### 📥 القناة المصدر")
                         source_list   = gr.Dropdown(choices=[], label="اختر من القائمة", interactive=True)
-                        source_manual = gr.Textbox(label="أو أدخل يدوياً (@username أو ID)", placeholder="@channel_name")
+                        source_manual = gr.Textbox(label="أو أدخل يدوياً (@username أو ID)", placeholder="@channel_name", value=ENV_SOURCE_CHANNEL)
                         source_info   = gr.Markdown()
 
                     with gr.Column():
                         gr.Markdown("#### 📤 القناة الوجهة")
                         dest_list   = gr.Dropdown(choices=[], label="اختر من القائمة", interactive=True)
-                        dest_manual = gr.Textbox(label="أو أدخل يدوياً", placeholder="@my_channel")
+                        dest_manual = gr.Textbox(label="أو أدخل يدوياً", placeholder="@my_channel", value=ENV_DEST_CHANNEL)
                         dest_info   = gr.Markdown()
 
                 # ملخص قبل النقل
@@ -654,49 +722,62 @@ def build_app():
             # ══════════════════════════════════════════════
             with gr.Tab("❓ المساعدة"):
                 gr.Markdown("""
-## كيفية الاستخدام
+## ⚡ الطريقة السريعة (موصى بها لـ HuggingFace)
+
+أضف هذه القيم في **Settings → Secrets** بالـ Space:
+
+| الاسم | القيمة | مطلوب؟ |
+|---|---|---|
+| `API_ID` | رقم API ID من my.telegram.org | ✅ |
+| `API_HASH` | نص API Hash | ✅ |
+| `SESSION_STRING` | نص الجلسة المُصدَّرة | ✅ |
+| `SOURCE_CHANNEL` | @username أو ID القناة المصدر | ❌ |
+| `DEST_CHANNEL` | @username أو ID القناة الوجهة | ❌ |
+
+عند حفظها وإعادة تشغيل Space → يتم الاتصال **تلقائياً**!
+
+---
+
+## الطريقة اليدوية
 
 ### الخطوة 1 — تسجيل الدخول
 1. اذهب إلى [my.telegram.org](https://my.telegram.org)
-2. سجل دخول بحسابك → **API development tools** → أنشئ تطبيقاً
-3. أدخل **API ID** و **API Hash** في التبويب الأول
-4. أدخل رقم هاتفك واضغط **إرسال كود التحقق**
-5. أدخل الكود المُرسَل إلى Telegram واضغط **تأكيد**
+2. سجل دخول → **API development tools** → أنشئ تطبيقاً
+3. أدخل **API ID** و **API Hash** واضغط **إرسال كود التحقق**
+4. أدخل الكود المُرسَل إلى Telegram واضغط **تأكيد**
+5. اضغط **تصدير الجلسة** واحفظها في HF Secrets باسم `SESSION_STRING`
 
-### الخطوة 2 — حفظ الجلسة (مهم لـ HuggingFace)
-بعد تسجيل الدخول، اضغط **تصدير الجلسة كـ String** واحفظ النتيجة في:
-`Settings → Secrets → SESSION_STRING`
-هذا يمنع الحاجة لإعادة تسجيل الدخول في كل مرة.
+### الخطوة 2 — اختيار القنوات
+- اضغط **تحديث قائمة القنوات** (أو أدخل @username يدوياً)
+- اختر المصدر والوجهة → اضغط **عرض معلومات القنوات**
 
-### الخطوة 3 — اختيار القنوات
-- اضغط **تحديث قائمة القنوات**
-- اختر المصدر (القناة المقيدة) والوجهة (قناتك الخاصة)
-- اضغط **عرض معلومات القنوات** للتأكد
-
-### الخطوة 4 — ضبط الإعدادات والنقل
+### الخطوة 3 — بدء النقل
 - حدد عدد الرسائل والتأخير (2 ثانية موصى بها)
 - اضغط **بدء النقل**
 
 ---
 
-### كيف يعمل؟
-بدلاً من **Forward** العادي الذي يُمنع بواسطة "Restrict Saving Content"،
+## كيف يعمل؟
+بدلاً من **Forward** العادي المُقيَّد بـ "Restrict Saving Content"،
 يستخدم التطبيق تقنية **Download-Upload**:
 1. يُنزّل الوسائط إلى ذاكرة مؤقتة
 2. يُعيد رفعها كرسائل جديدة
 3. يحذف الملفات المؤقتة فوراً
 
-### دعم الألبومات (جديد v2.1)
-التطبيق يكتشف تلقائياً الرسائل المجمّعة (Albums/MediaGroups) وينقلها كألبوم واحد
-بدل إرسال كل صورة/فيديو منفصلاً.
+## دعم الألبومات (v2.1)
+يكتشف تلقائياً الرسائل المجمّعة (Albums/MediaGroups) وينقلها كألبوم واحد.
 
-### نصائح للاستخدام الآمن
-- استخدم تأخيراً لا يقل عن **2 ثانية**
-- لا تنقل أكثر من **500 رسالة** في الجلسة الواحدة
-- استرح بين العمليات المتكررة
+## نصائح للاستخدام الآمن
+- تأخير لا يقل عن **2 ثانية** | لا أكثر من **500 رسالة** بالجلسة
 - **لا تُشارك Session String** مع أي أحد
-- نظّف المجلد المؤقت بانتظام من تبويب الإحصائيات
+- نظّف المجلد المؤقت من تبويب الإحصائيات
                 """)
+
+        # ── Auto-connect on page load ───────────────────────
+        app.load(
+            _auto_connect,
+            outputs=[code_section, login_status, export_section],
+        )
 
         # ── Wire Events ───────────────────────────────────────
 
