@@ -361,7 +361,7 @@ def do_channel_info(channel_id):
         info = _run(forwarder.get_channel_info(channel_id))
         protected = "🔒 نعم" if info.get("protected") else "✅ لا"
         restricted = "⛔ نعم" if info.get("restricted") else "✅ لا"
-        members = info.get("participants_count", 0) or "غير معروف"
+        members = info.get("participants_count") or "غير معروف"
         username = info.get("username") or "بدون @username"
         return (
             f"**{info['title']}**\n\n"
@@ -394,10 +394,12 @@ def do_pre_forward_info(source_val, dest_val, source_manual_val, dest_manual_val
 
         src_protected = "🔒 محمي" if src_info.get("protected") else "✅ عادي"
         dst_protected = "🔒 محمي" if dst_info.get("protected") else "✅ عادي"
+        src_members = src_info.get('participants_count') or "غير معروف"
+        dst_members = dst_info.get('participants_count') or "غير معروف"
 
         return _status_html(
-            f"📥 **المصدر**: {src_info['title']} ({src_info.get('participants_count', '?')} عضو, {src_protected})<br>"
-            f"📤 **الوجهة**: {dst_info['title']} ({dst_info.get('participants_count', '?')} عضو, {dst_protected})<br>"
+            f"📥 **المصدر**: {src_info['title']} ({src_members} عضو, {src_protected})<br>"
+            f"📤 **الوجهة**: {dst_info['title']} ({dst_members} عضو, {dst_protected})<br>"
             f"{'⚠️ سيتم استخدام تقنية Download-Upload لتجاوز حماية المحتوى' if src_info.get('protected') else '✅ المحتوى غير محمي — النقل عادي'}",
             "info"
         )

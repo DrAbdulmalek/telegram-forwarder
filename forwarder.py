@@ -265,7 +265,7 @@ class TelegramForwarder:
 
     # ── Dialogs ───────────────────────────────────────────────
 
-    async def get_dialogs(self, limit: int = 200) -> List[Dict]:
+    async def get_dialogs(self, limit: int = 500) -> List[Dict]:
         """جلب قائمة القنوات والمجموعات. يبني أيضاً entity cache لاستخدام النقل لاحقاً."""
         if not self.client:
             raise RuntimeError("Not connected")
