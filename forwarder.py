@@ -270,18 +270,12 @@ class TelegramForwarder:
         if not self.client:
             raise RuntimeError("Not connected")
 
+        # ابنِ الكاش الكامل أولاً (كل المحادثات بدون limit)
+        await self._build_entity_cache(force=True)
+
         dialogs = []
-        self._entity_cache = {}
         try:
             async for dialog in self.client.iter_dialogs(limit=limit):
-                # خزّن كل dialog في الكاش بصرف النظر عن limit المعروض،
-                # هذا يضمن أن النقل يجد القناة حتى لو لم تظهر في القائمة المعروضة
-                self._entity_cache[dialog.id] = dialog.entity
-                if dialog.id < 0:
-                    id_str = str(dialog.id)
-                    if id_str.startswith("-100"):
-                        self._entity_cache[int(id_str[4:])] = dialog.entity
-
                 if dialog.is_channel or dialog.is_group:
                     entity = dialog.entity
                     dialogs.append({
@@ -302,16 +296,19 @@ class TelegramForwarder:
             )
         return dialogs
 
-    async def _build_entity_cache(self) -> None:
+    async def _build_entity_cache(self, force: bool = False) -> None:
         """
         بناء فهرس داخلي {id: entity} من كل المحادثات.
         Telethon يحتاج access_hash صحيحاً لأي channel/chat، وهذا الوحيد
         المضمون توفّره من iter_dialogs() — لا يمكن تركيبه يدوياً عبر
         PeerChannel(id) فقط لأنه يفتقد access_hash فيفشل دائماً.
+
+        force=True يُعيد البناء حتى لو كان الكاش موجوداً.
         """
-        if self._entity_cache is not None:
+        if not force and self._entity_cache is not None:
             return
         self._entity_cache = {}
+        count = 0
         try:
             async for dialog in self.client.iter_dialogs():
                 self._entity_cache[dialog.id] = dialog.entity
@@ -320,10 +317,12 @@ class TelegramForwarder:
                     id_str = str(dialog.id)
                     if id_str.startswith("-100"):
                         self._entity_cache[int(id_str[4:])] = dialog.entity
+                count += 1
         except FloodWaitError:
             raise  # دعها تُعالَج في الطبقة الأعلى
         except Exception as e:
             logger.warning(f"Failed building entity cache: {e}")
+        logger.info(f"Entity cache built: {count} dialogs, {len(self._entity_cache)} entries")
 
     async def _resolve_entity(self, identifier):
         """
@@ -442,6 +441,9 @@ class TelegramForwarder:
         cb = progress_callback or self._progress_callback
         result = ForwardResult()
         rate = RateLimiter(base_delay=config.delay)
+
+        # تأكد من بناء الكاش قبل البدء (يتغلّب على نسيان الضغط على "تحديث")
+        await self._build_entity_cache(force=True)
 
         try:
             source = await self._resolve_entity(config.source_channel)
