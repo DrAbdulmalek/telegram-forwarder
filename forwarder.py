@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram Content Forwarder — Core Module v2.1
-==============================================
+Telegram Content Forwarder — Core Module v2
+=============================================
 إصلاحات رئيسية عن النسخة الأولى:
   1. مجلد temp/ يُنشأ تلقائياً (كان يُسبّب FileNotFoundError)
   2. إضافة retry exponential backoff بدل retry واحد
@@ -14,13 +14,6 @@ Telegram Content Forwarder — Core Module v2.1
   8. إضافة progress_callback حقيقي مع نسبة مئوية
   9. إصلاح bug: _phone_code_hash غير مُعرَّف عند استدعاء verify_code مباشرة
   10. إضافة export_session_string لحفظ الجلسة في HF Secrets
-
-تحسينات v2.1:
-  11. دعم كامل لـ Albums/MediaGroups (جمع الرسائل وإرسالها كألبوم)
-  12. asyncio.Semaphore للحد من التنزيلات المتزامنة (تجنب OOM)
-  13. تصفية ذكية: تجاهل WebPage، دعم reverse_order
-  14. ForwardResult منظّم مع to_dict()
-  15. إضافة logging مفصّل للألبومات
 """
 
 import os
@@ -173,6 +166,7 @@ class TelegramForwarder:
         # State لعملية تسجيل الدخول
         self._phone: Optional[str] = None
         self._phone_code_hash: Optional[str] = None
+        self._entity_cache: Optional[dict] = None  # {id: entity} مبني من iter_dialogs
 
     # ── Connection ────────────────────────────────────────────
 
@@ -184,7 +178,11 @@ class TelegramForwarder:
         else:
             session = self.session_name
 
-        self.client = TelegramClient(session, self.api_id, self.api_hash)
+        self.client = TelegramClient(
+            session, self.api_id, self.api_hash,
+            catch_up=False,           # لا تُزامن الرسائل الفائتة تلقائياً
+            sequential_updates=True,  # يقلّل الطلبات المتزامنة عند الاتصال
+        )
         await self.client.connect()
         return self.client
 
@@ -212,6 +210,7 @@ class TelegramForwarder:
             except Exception:
                 pass
             self.client = None
+        self._entity_cache = None
         logger.info("Disconnected")
 
     # ── Authentication ────────────────────────────────────────
@@ -267,24 +266,64 @@ class TelegramForwarder:
     # ── Dialogs ───────────────────────────────────────────────
 
     async def get_dialogs(self, limit: int = 200) -> List[Dict]:
-        """جلب قائمة القنوات والمجموعات."""
+        """جلب قائمة القنوات والمجموعات. يبني أيضاً entity cache لاستخدام النقل لاحقاً."""
         if not self.client:
             raise RuntimeError("Not connected")
 
         dialogs = []
-        async for dialog in self.client.iter_dialogs(limit=limit):
-            if dialog.is_channel or dialog.is_group:
-                entity = dialog.entity
-                dialogs.append({
-                    "id":                 dialog.id,
-                    "title":              dialog.title,
-                    "username":           getattr(entity, "username", None),
-                    "type":               "channel" if dialog.is_channel else "group",
-                    "participants_count": getattr(entity, "participants_count", 0),
-                    "restricted":         getattr(entity, "restricted", False),
-                    "protected":          getattr(entity, "noforwards", False),
-                })
+        self._entity_cache = {}
+        try:
+            async for dialog in self.client.iter_dialogs(limit=limit):
+                # خزّن كل dialog في الكاش بصرف النظر عن limit المعروض،
+                # هذا يضمن أن النقل يجد القناة حتى لو لم تظهر في القائمة المعروضة
+                self._entity_cache[dialog.id] = dialog.entity
+                if dialog.id < 0:
+                    id_str = str(dialog.id)
+                    if id_str.startswith("-100"):
+                        self._entity_cache[int(id_str[4:])] = dialog.entity
+
+                if dialog.is_channel or dialog.is_group:
+                    entity = dialog.entity
+                    dialogs.append({
+                        "id":                 dialog.id,
+                        "title":              dialog.title,
+                        "username":           getattr(entity, "username", None),
+                        "type":               "channel" if dialog.is_channel else "group",
+                        "participants_count": getattr(entity, "participants_count", 0),
+                        "restricted":         getattr(entity, "restricted", False),
+                        "protected":          getattr(entity, "noforwards", False),
+                    })
+        except FloodWaitError as e:
+            mins = e.seconds // 60
+            raise RuntimeError(
+                f"⏳ Telegram يطلب الانتظار {mins} دقيقة قبل المحاولة مجدداً "
+                f"(حماية ضد الاستخدام المكثف). هذا ليس خطأ في التطبيق — "
+                f"يُرجى الانتظار ثم إعادة المحاولة، وتجنّب إعادة تشغيل الجلسة بشكل متكرر."
+            )
         return dialogs
+
+    async def _build_entity_cache(self) -> None:
+        """
+        بناء فهرس داخلي {id: entity} من كل المحادثات.
+        Telethon يحتاج access_hash صحيحاً لأي channel/chat، وهذا الوحيد
+        المضمون توفّره من iter_dialogs() — لا يمكن تركيبه يدوياً عبر
+        PeerChannel(id) فقط لأنه يفتقد access_hash فيفشل دائماً.
+        """
+        if self._entity_cache is not None:
+            return
+        self._entity_cache = {}
+        try:
+            async for dialog in self.client.iter_dialogs():
+                self._entity_cache[dialog.id] = dialog.entity
+                # خزّن أيضاً بالصيغة الموجبة (بدون -100) لتسهيل المطابقة
+                if dialog.id < 0:
+                    id_str = str(dialog.id)
+                    if id_str.startswith("-100"):
+                        self._entity_cache[int(id_str[4:])] = dialog.entity
+        except FloodWaitError:
+            raise  # دعها تُعالَج في الطبقة الأعلى
+        except Exception as e:
+            logger.warning(f"Failed building entity cache: {e}")
 
     async def _resolve_entity(self, identifier):
         """
@@ -293,12 +332,13 @@ class TelegramForwarder:
         يدعم:
           - @username
           - رابط https://t.me/username أو t.me/+invite
-          - ID رقمي خام (مثل -1001927197663) — يحتاج تحويل إلى PeerChannel
-          - ID موجب (channel_id بدون -100) — يُحوَّل تلقائياً
+          - ID رقمي خام (مثل -1001927197663 أو 1927197663)
 
-        المشكلة الأصلية: تمرير string لـ ID خام مباشرة إلى get_entity()
-        يفشل لأن Telethon يبحث في session cache المحلي فقط لمعرّفات الأرقام،
-        ولا يعرف نوع الـ Peer (channel/chat/user) بدون استخدام PeerChannel.
+        ملاحظة مهمة: لا يمكن بناء PeerChannel(id) يدوياً والاتصال به مباشرة
+        لأنه يفتقد access_hash المطلوب من Telegram API — هذا يفشل دائماً
+        برسالة "Cannot find any entity" حتى لو كان الـ ID صحيحاً 100%.
+        الحل الموثوق الوحيد: استخدام access_hash من dialogs المُحمَّلة مسبقاً
+        (وهو متوفر فقط بعد المرور على iter_dialogs على الأقل مرة واحدة).
         """
         if not self.client:
             raise RuntimeError("Not connected")
@@ -317,48 +357,36 @@ class TelegramForwarder:
         if identifier.startswith("@") or not self._is_numeric_id(identifier):
             return await self.client.get_entity(identifier)
 
-        # حالة: ID رقمي — قد يكون بصيغة -100xxxxxxxxxx (قناة) أو رقم عضو
+        # حالة: ID رقمي — اعتمد على الكاش المبني من iter_dialogs (access_hash صحيح)
         raw_id = int(identifier)
 
-        # أولاً: جرّب البحث المباشر في الـ dialogs المُخزَّنة (الأسرع والأكثر دقة)
-        try:
-            async for dialog in self.client.iter_dialogs():
-                if dialog.id == raw_id:
-                    return dialog.entity
-        except Exception:
-            pass
+        await self._build_entity_cache()
 
-        # ثانياً: حوّل بصيغة PeerChannel الصحيحة
-        from telethon.tl.types import PeerChannel, PeerChat, PeerUser
+        if raw_id in self._entity_cache:
+            return self._entity_cache[raw_id]
 
+        # جرّب الصيغة الموجبة إذا أُدخلت بصيغة -100
         if raw_id < 0:
-            # صيغة -100xxxxxxxxxx → channel_id الحقيقي بعد إزالة -100
             id_str = str(raw_id)
             if id_str.startswith("-100"):
-                channel_id = int(id_str[4:])  # احذف "-100"
-                try:
-                    return await self.client.get_entity(PeerChannel(channel_id))
-                except Exception:
-                    pass
-            else:
-                # مجموعة عادية (-xxxxxxxxx بدون 100)
-                chat_id = abs(raw_id)
-                try:
-                    return await self.client.get_entity(PeerChat(chat_id))
-                except Exception:
-                    pass
+                positive_id = int(id_str[4:])
+                if positive_id in self._entity_cache:
+                    return self._entity_cache[positive_id]
         else:
-            # مستخدم أو channel_id موجب بدون البادئة
-            try:
-                return await self.client.get_entity(PeerChannel(raw_id))
-            except Exception:
-                try:
-                    return await self.client.get_entity(PeerUser(raw_id))
-                except Exception:
-                    pass
+            # جرّب الصيغة السالبة -100xxxx إذا أُدخل الرقم موجباً
+            negative_id = int(f"-100{raw_id}")
+            if negative_id in self._entity_cache:
+                return self._entity_cache[negative_id]
 
-        # كحل أخير: مرّر كما هو ودع Telethon يحاول
-        return await self.client.get_entity(raw_id)
+        # كحل أخير فقط — قد يفشل لنفس سبب access_hash لكن نحاول
+        try:
+            return await self.client.get_entity(raw_id)
+        except Exception:
+            raise ValueError(
+                f"لم يُعثر على القناة بالمعرّف {identifier}. "
+                f"تأكد أنك عضو في هذه القناة، أو اخترها من القائمة المنسدلة "
+                f"بدل إدخال الـ ID يدوياً (القائمة تضمن صحة الربط)."
+            )
 
     @staticmethod
     def _is_numeric_id(s: str) -> bool:
@@ -371,7 +399,15 @@ class TelegramForwarder:
         """جلب معلومات قناة محددة."""
         if not self.client:
             raise RuntimeError("Not connected")
-        entity = await self._resolve_entity(channel_id)
+        try:
+            entity = await self._resolve_entity(channel_id)
+        except FloodWaitError as e:
+            mins = e.seconds // 60
+            raise RuntimeError(
+                f"⏳ Telegram يطلب الانتظار {mins} دقيقة (حماية ضد الطلبات المتكررة). "
+                f"المعلومات التفصيلية للقناة غير ضرورية لبدء النقل — يمكنك تجاهل هذا "
+                f"وإدخال معرّف القناة يدوياً أو اختيارها من القائمة مباشرة."
+            )
         return {
             "id":                 entity.id,
             "title":              getattr(entity, "title", None) or getattr(entity, "first_name", "—"),
@@ -477,7 +513,7 @@ class TelegramForwarder:
                             result.failed += 1
                     else:
                         result.skipped += 1
-                        continue
+                    continue
 
                 # ── Album Detection ───────────────────────────
 
@@ -731,12 +767,11 @@ class TelegramForwarder:
             msg_tmp.mkdir(parents=True, exist_ok=True)
 
             try:
-                async with DOWNLOAD_SEMAPHORE:
-                    # تنزيل الوسائط
-                    file_path = await asyncio.wait_for(
-                        message.download_media(file=str(msg_tmp) + "/"),
-                        timeout=120,  # 2 دقيقة لكل ملف
-                    )
+                # تنزيل الوسائط
+                file_path = await asyncio.wait_for(
+                    message.download_media(file=str(msg_tmp) + "/"),
+                    timeout=120,  # 2 دقيقة لكل ملف
+                )
 
                 if file_path and os.path.exists(file_path):
                     # رفع كرسالة جديدة
