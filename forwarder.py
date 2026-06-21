@@ -362,7 +362,7 @@ class TelegramForwarder:
                         "title":              dialog.title,
                         "username":           getattr(entity, "username", None),
                         "type":               "channel" if dialog.is_channel else "group",
-                        "participants_count": getattr(entity, "participants_count", 0),
+                        "participants_count": getattr(entity, "participants_count", None) or "غير معروف",
                         "restricted":         getattr(entity, "restricted", False),
                         "protected":          getattr(entity, "noforwards", False),
                     })
@@ -487,7 +487,7 @@ class TelegramForwarder:
             "id":                 entity.id,
             "title":              getattr(entity, "title", None) or getattr(entity, "first_name", "—"),
             "username":           getattr(entity, "username", None),
-            "participants_count": getattr(entity, "participants_count", 0),
+            "participants_count": getattr(entity, "participants_count", None) or "غير معروف",
             "restricted":         getattr(entity, "restricted", False),
             "protected":          getattr(entity, "noforwards", False),
         }

@@ -257,7 +257,7 @@ def do_channel_info(channel_id):
         protected = "🔒 نعم" if info.get("protected") else "✅ لا"
         return (
             f"**{info['title']}** | "
-            f"الأعضاء: {info['participants_count']:,} | "
+            f"الأعضاء: {info.get('participants_count') or 'غير معروف':,} | "
             f"المحتوى محمي: {protected}"
         )
     except RuntimeError as e:
