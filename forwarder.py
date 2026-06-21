@@ -62,6 +62,31 @@ TEMP_DIR.mkdir(parents=True, exist_ok=True)
 # ─── Config ───────────────────────────────────────────────────
 
 @dataclass
+class MessagePreview:
+    """معاينة رسالة واحدة قبل اتخاذ قرار نقلها."""
+    message_id: int
+    date: str                    # ISO format
+    text_snippet: str            # أول 100 حرف من النص
+    has_media: bool
+    media_type: str              # photo | video | document | audio | none
+    media_size_mb: float = 0.0
+    is_forward: bool = False
+    selected: bool = True        # افتراضياً مُحدَّدة — المستخدم يُلغي ما لا يريد
+
+    def to_dict(self) -> dict:
+        return {
+            "message_id":    self.message_id,
+            "date":          self.date,
+            "text_snippet":  self.text_snippet,
+            "has_media":     self.has_media,
+            "media_type":    self.media_type,
+            "media_size_mb": round(self.media_size_mb, 2),
+            "is_forward":    self.is_forward,
+            "selected":      self.selected,
+        }
+
+
+@dataclass
 class ForwardConfig:
     """إعدادات عملية النقل."""
     source_channel: str
@@ -77,6 +102,7 @@ class ForwardConfig:
     max_retries: int     = 3          # محاولات إعادة لكل رسالة
     send_caption: bool   = True       # إرفاق نص الرسالة مع الوسائط
     reverse_order: bool  = False      # ترتيب تصاعدي (الأقدم أولاً)
+    selected_ids: Optional[List[int]] = None  # إن حُدِّدت، يُنقَل هؤلاء فقط (من المعاينة)
 
 
 @dataclass
@@ -203,10 +229,50 @@ class TelegramForwarder:
         """
         صدّر الجلسة كـ string للحفظ في HuggingFace Secrets.
         استخدم هذا بدل ملف .session لتجنّب فقدان الجلسة عند إعادة تشغيل Space.
+
+        ملاحظة فنية مهمة: إذا سجّل المستخدم الدخول لأول مرة (بدون تمرير
+        session_string مسبقاً)، فإن self.client.session هو SQLiteSession
+        وليس StringSession. SQLiteSession.save() يُرجع None دائماً (تأكَّدنا
+        بالاختبار المباشر على المصدر) لأن حفظها يحدث تلقائياً على القرص،
+        فهذا تحديداً هو سبب ظهور مربع النص فارغاً سابقاً. الحل: نبني
+        StringSession جديدة من بيانات الجلسة الحالية (auth_key + dc) بغض
+        النظر عن نوع الجلسة الأصلية، ثم نُصدِّرها.
         """
         if not self.client:
             raise RuntimeError("Not connected")
-        return self.client.session.save()
+
+        from telethon.sessions import StringSession
+
+        # إذا كانت الجلسة بالفعل StringSession، التصدير المباشر يعمل بشكل صحيح
+        if isinstance(self.client.session, StringSession):
+            result = self.client.session.save()
+            if result:
+                return result
+
+        # غير ذلك (SQLiteSession أو غيرها) — ابنِ StringSession جديدة
+        # من بيانات الاتصال الفعلية الحالية (auth_key, dc_id, server_address, port)
+        session = self.client.session
+        auth_key = session.auth_key
+
+        if auth_key is None:
+            raise RuntimeError(
+                "لا يمكن تصدير الجلسة — لم تكتمل عملية تسجيل الدخول بعد "
+                "(auth_key غير موجود). تأكد من إتمام تسجيل الدخول بنجاح أولاً."
+            )
+
+        new_string_session = StringSession()
+        new_string_session.set_dc(
+            session.dc_id,
+            session.server_address,
+            session.port,
+        )
+        new_string_session.auth_key = auth_key
+
+        exported = new_string_session.save()
+        if not exported:
+            raise RuntimeError("فشل بناء Session String — راجع سجلات الخادم")
+
+        return exported
 
     async def disconnect(self):
         if self.client:
@@ -270,13 +336,15 @@ class TelegramForwarder:
 
     # ── Dialogs ───────────────────────────────────────────────
 
-    async def get_dialogs(self, limit: int = 200) -> List[Dict]:
+    async def get_dialogs(self, limit: int = 500) -> List[Dict]:
         """جلب قائمة القنوات والمجموعات. يبني أيضاً entity cache لاستخدام النقل لاحقاً."""
         if not self.client:
             raise RuntimeError("Not connected")
 
+        # ابنِ الكاش الكامل أولاً (كل المحادثات بدون limit)
+        await self._build_entity_cache(force=True)
+
         dialogs = []
-        self._entity_cache = {}
         try:
             async for dialog in self.client.iter_dialogs(limit=limit):
                 # خزّن كل dialog في الكاش بصرف النظر عن limit المعروض،
@@ -307,14 +375,16 @@ class TelegramForwarder:
             )
         return dialogs
 
-    async def _build_entity_cache(self) -> None:
+    async def _build_entity_cache(self, force: bool = False) -> None:
         """
         بناء فهرس داخلي {id: entity} من كل المحادثات.
         Telethon يحتاج access_hash صحيحاً لأي channel/chat، وهذا الوحيد
         المضمون توفّره من iter_dialogs() — لا يمكن تركيبه يدوياً عبر
         PeerChannel(id) فقط لأنه يفتقد access_hash فيفشل دائماً.
+
+        force=True يُعيد البناء حتى لو كان الكاش موجوداً.
         """
-        if self._entity_cache is not None:
+        if not force and self._entity_cache is not None:
             return
         self._entity_cache = {}
         try:
@@ -422,6 +492,91 @@ class TelegramForwarder:
             "protected":          getattr(entity, "noforwards", False),
         }
 
+    # ── Preview (قبل النقل) ───────────────────────────────────
+
+    async def preview_messages(
+        self,
+        config: ForwardConfig,
+    ) -> List[MessagePreview]:
+        """
+        جلب قائمة معاينة للرسائل المطابقة للفلاتر — بدون أي نقل فعلي.
+        المستخدم يختار منها لاحقاً ما يريد نقله عبر config.selected_ids.
+        """
+        if not self.client:
+            raise RuntimeError("Not connected")
+
+        try:
+            source = await self._resolve_entity(config.source_channel)
+        except ChannelPrivateError:
+            raise RuntimeError("القناة المصدر خاصة أو لست عضواً فيها")
+
+        iter_kwargs: Dict[str, Any] = {
+            "limit":   config.limit,
+            "reverse": config.reverse_order,
+        }
+        if config.start_id:
+            iter_kwargs["min_id"] = config.start_id - 1
+        if config.end_id:
+            iter_kwargs["max_id"] = config.end_id + 1
+
+        previews: List[MessagePreview] = []
+
+        media_type_map = {
+            MessageMediaPhoto:    "photo",
+            MessageMediaDocument: "document",
+        }
+
+        async for message in self.client.iter_messages(source, **iter_kwargs):
+            if config.skip_forwards and message.fwd_from:
+                continue
+            if config.filter_text and message.text:
+                if config.filter_text.lower() not in message.text.lower():
+                    continue
+            if config.media_only and not message.media:
+                continue
+            if config.text_only and message.media:
+                continue
+
+            media_type = "none"
+            size_mb = 0.0
+            if message.media and not isinstance(message.media, MessageMediaWebPage):
+                media_type = media_type_map.get(type(message.media), "media")
+                size_mb = self._estimate_media_size(message)
+
+            text = (message.text or "").strip()
+            snippet = (text[:100] + "…") if len(text) > 100 else text
+
+            previews.append(MessagePreview(
+                message_id=message.id,
+                date=message.date.isoformat() if message.date else "",
+                text_snippet=snippet or "(بدون نص)",
+                has_media=bool(message.media) and not isinstance(message.media, MessageMediaWebPage),
+                media_type=media_type,
+                media_size_mb=size_mb,
+                is_forward=bool(message.fwd_from),
+                selected=True,
+            ))
+
+        return previews
+
+    @staticmethod
+    def _estimate_media_size(message: Message) -> float:
+        """حجم تقريبي للوسائط بالميغابايت دون تنزيلها."""
+        try:
+            media = message.media
+            if hasattr(media, "document") and media.document:
+                return round(media.document.size / (1024 * 1024), 2)
+            if hasattr(media, "photo") and media.photo:
+                # الصور لا تحمل حجماً مباشراً — أكبر sizes entry تقريبي
+                sizes = getattr(media.photo, "sizes", [])
+                if sizes:
+                    largest = sizes[-1]
+                    size_bytes = getattr(largest, "size", 0) or 0
+                    return round(size_bytes / (1024 * 1024), 2)
+        except Exception:
+            pass
+        return 0.0
+
     # ── Forward ───────────────────────────────────────────────
 
     def cancel(self):
@@ -447,6 +602,9 @@ class TelegramForwarder:
         cb = progress_callback or self._progress_callback
         result = ForwardResult()
         rate = RateLimiter(base_delay=config.delay)
+
+        # تأكد من بناء الكاش الكامل قبل البدء
+        await self._build_entity_cache(force=True)
 
         try:
             source = await self._resolve_entity(config.source_channel)
@@ -477,6 +635,12 @@ class TelegramForwarder:
                 result.total += 1
 
                 # ── Filters ───────────────────────────────────
+
+                # إذا حدّد المستخدم اختياره من شاشة المعاينة، التزم به حصراً
+                if config.selected_ids is not None:
+                    if message.id not in config.selected_ids:
+                        result.skipped += 1
+                        continue
 
                 if config.skip_forwards and message.fwd_from:
                     result.skipped += 1
