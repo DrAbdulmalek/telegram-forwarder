@@ -8,6 +8,10 @@ app_port: 7860
 pinned: false
 ---
 
+> ⚡ **Independent Side Product** — This is a standalone Telegram utility. It is **NOT** part of the [OmniMedical Suite](https://github.com/DrAbdulmalek/omni-medical-suite) medical OCR ecosystem.
+>
+> For medical document processing, see: [OmniMedical Suite](https://github.com/DrAbdulmalek/omni-medical-suite) · [Live Demo](https://huggingface.co/spaces/DrAbdulmalek/medical-handwriting-ocr)
+
 # 📨 Telegram Content Forwarder v2.1
 
 [![Hugging Face Spaces](https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue)](https://huggingface.co/spaces/DrAbdulmalek/telegram-forwarder)
