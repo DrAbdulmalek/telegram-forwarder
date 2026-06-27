@@ -1,0 +1,19 @@
+[flake8]
+max-line-length = 120
+exclude =
+    .git,
+    __pycache__,
+    node_modules,
+    .next,
+    build,
+    dist,
+    *.egg-info,
+    .venv,
+    venv
+ignore =
+    E501,
+    W503,
+    E741
+per-file-ignores =
+    test_*.py: B101
+    *_test.py: B101
